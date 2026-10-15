@@ -1,0 +1,5423 @@
+--
+-- Sich
+-- Cossacks 3 lua server
+--
+-- This file: Sich v0.2.9 by 3skcassoc (https://github.com/3skcassoc/sich), as extended by qossacks_4 0.1
+-- (https://github.com/kewl-ua/qossacks_4), with the c3resume additions (!save, !autosave, !saves, !load).
+-- Sich and qossacks_4 are under the WTFPL (see LICENSES/WTFPL.txt); the c3resume additions are also available
+-- under the MIT license (see LICENSE). Details: THIRD_PARTY_NOTICES.md
+--
+
+SICH_VERSION = "qossacks_4 0.1 + c3resume 2.2 (Sich v0.2.9)"
+
+-- // xclass // --
+do
+	local new = function (class, ...)
+		return setmetatable({__class = class}, class.__objmt):__create(...)
+	end
+	xclass = setmetatable(
+	{
+		__create = function (self)
+			return self
+		end,
+	},
+	{
+		__call = function (xclass, class)
+			class.__objmt = {__index = class}
+			return setmetatable(class, {
+				__index = class.__parent or xclass,
+				__call = new,
+			})
+		end,
+	})
+end
+
+-- // xstore // --
+do
+	local log_wait = {}
+	local function log(...)
+		if not xlog then
+			return table.insert(log_wait, {...})
+		end
+		log = xlog("xstore")
+		for _, wait in ipairs(log_wait) do
+			log(unpack(wait))
+		end
+		log_wait = nil
+		return log(...)
+	end
+	local function do_serialize(value, result, indent)
+		local value_type = type(value)
+		if value_type == "string" then
+			table.insert(result, (("%q"):format(value):gsub("\\\n", "\\n")))
+		elseif value_type == "nil" or value_type == "boolean" or value_type == "number" then
+			table.insert(result, tostring(value))
+		elseif value_type ~= "table" then
+			error("can not serialize: " .. value_type)
+		elseif next(value) == nil then
+			table.insert(result, "{}")
+		else
+			local keys = {}
+			for key in pairs(value) do
+				table.insert(keys, key)
+			end
+			table.sort(keys, function (a, b)
+				local ta, tb = type(a), type(b)
+				if ta ~= tb then
+					a, b = ta, tb
+				elseif ta == "string" then
+					local na, nb = tonumber(a), tonumber(b)
+					if na and nb then
+						a, b = na, nb
+					end
+				elseif ta ~= "number" then
+					a, b = tostring(a), tostring(b)
+				end
+				return a < b
+			end)
+			table.insert(result, "{\n")
+			for _, key in ipairs(keys) do
+				table.insert(result, ("\t"):rep(indent + 1))
+				table.insert(result, "[")
+				do_serialize(key, result, indent + 1)
+				table.insert(result, "] = ")
+				do_serialize(value[key], result, indent + 1)
+				table.insert(result, ",\n")
+			end
+			table.insert(result, ("\t"):rep(indent))
+			table.insert(result, "}")
+		end
+		return result
+	end
+	local function serialize(value)
+		return table.concat(do_serialize(value, {}, 0))
+	end
+	local path = arg and arg[0] and arg[0]:match("^(.+)[/\\][^/\\]+[/\\]?$") or "."
+	path = path:gsub("%%", "%%%%") .. "/%s.store"
+	log("debug", "path: %q", path)
+	xstore =
+	{
+		load = function (name, default)
+			name = path:format(name)
+			log("debug", "loading %q", name)
+			local file, msg = io.open(name, "r")
+			if not file then
+				log("debug", msg)
+				return default
+			end
+			file:close()
+			local fun = assert(loadfile(name))
+			setfenv(fun, _G)
+			local _, data = assert(pcall(fun))
+			return data
+		end,
+		save = function (name, data)
+			name = path:format(name)
+			log("debug", "saving %q", name)
+			local str = serialize(data)
+			-- write a new file and rename it over the old one: a crash or a full disk
+			-- in the middle of a write must not leave a truncated store
+			local tmp = name .. ".tmp"
+			local file, msg = io.open(tmp, "w")
+			if not file then
+				log("error", msg)
+				return false
+			end
+			local ok, err = file:write("return ", str, "\n")
+			if ok then
+				ok, err = file:close()
+			else
+				file:close()
+			end
+			if not ok then
+				log("error", "saving %q: %s", name, tostring(err))
+				os.remove(tmp)
+				return false
+			end
+			if not os.rename(tmp, name) then
+				-- Windows does not rename over an existing file
+				os.remove(name)
+				ok, err = os.rename(tmp, name)
+				if not ok then
+					log("error", "saving %q: %s", name, tostring(err))
+					return false
+				end
+			end
+			return true
+		end,
+	}
+end
+
+-- // xconfig // --
+do
+	xconfig = xstore.load("config", {})
+end
+
+-- // xlog // --
+do
+	local numeric =
+	{
+		debug = 0,
+		info = 1,
+		warn = 2,
+		error = 3,
+		disabled = 4,
+	}
+	local name_length = 10
+	local level = numeric["info"]
+	local units = {}
+	local output = io.output()
+	if type(xconfig.log) == "table" then
+		level = assert(numeric[xconfig.log.level or "info"], "invalid log level")
+		if xconfig.log.units then
+			for unit, level in pairs(xconfig.log.units) do
+				units[unit] = assert(numeric[level], "invalid log level")
+			end
+		end
+		output = xconfig.log.output or output
+	elseif type(xconfig.log) == "string" then
+		level = assert(numeric[xconfig.log], "invalid log level")
+	end
+	local function log_check(self, level)
+		return assert(numeric[level], "invalid log level") >= self.minlevel
+	end
+	local function log_print(self, level, fmt, ...)
+		if not log_check(self, level) then
+			return
+		end
+		return output:write(
+			os.date("%Y.%m.%d %H:%M:%S"),
+			(" | %%-5s | %%-%ds | %%%ds%s")
+				:format(name_length, self.indent, fmt)
+				:format(level, self.name, "", ...)
+				:gsub("\\\n", "\\n"),
+			"\n")
+	end
+	local function log_inc(self, value)
+		self.indent = self.indent + (value or 1)
+		return self
+	end
+	local function log_dec(self, value)
+		self.indent = self.indent - (value or 1)
+		return self
+	end
+	local function log_dummy()
+	end
+	local log_disabled = setmetatable({
+		minlevel = numeric["disabled"],
+		check = log_dummy,
+		indent = 0,
+		inc = log_dummy,
+		dec = log_dummy,
+	}, {
+		__call = log_dummy,
+	})
+	xlog = function (unit, name)
+		assert(type(unit) == "string", "no unit name")
+		name = name or unit
+		if name_length < #name then
+			name_length = #name
+		end
+		local minlevel = units[unit] or level
+		if minlevel >= numeric["disabled"] then
+			return log_disabled
+		end
+		return setmetatable({
+			name = name,
+			minlevel = minlevel,
+			check = log_check,
+			indent = 0,
+			inc = log_inc,
+			dec = log_dec,
+		}, {
+			__call = log_print,
+		})
+	end
+end
+
+-- // xversion // --
+do
+	local log = xlog("xversion")
+	xversion =
+	{
+		sich = SICH_VERSION or "Sich DEV",
+		lua = jit and jit.version or _VERSION,
+		socket = (require "socket")._VERSION,
+	}
+	log("info", "%s, %s, %s", xversion.sich, xversion.lua, xversion.socket)
+end
+
+-- // xconst // --
+do
+	xconst = setmetatable({},
+		{
+			__call = function (_, tbl)
+				local result = {}
+				for code, name in pairs(tbl) do
+					result[code] = name
+					result[name] = code
+				end
+				return result
+			end,
+		})
+	xcmd = xconst
+	{
+		[0x0190] = "SHELL_CONSOLE",                -- 
+		[0x0191] = "PING",                         -- lePingInfo
+		[0x0192] = "SERVER_CLIENTINFO",            -- LanPublicServerUpdateClientInfo
+		[0x0193] = "USER_CLIENTINFO",              -- leShellClientInfo
+		[0x0194] = "SERVER_SESSION_MSG",           -- LanPublicServerSendSessionMessage
+		[0x0195] = "USER_SESSION_MSG",             -- leShellSessionMessage
+		[0x0196] = "SERVER_MESSAGE",               -- LanPublicServerSendMessage
+		[0x0197] = "USER_MESSAGE",                 -- leShellMessage
+		[0x0198] = "SERVER_REGISTER",              -- LanPublicServerRegister
+		[0x0199] = "USER_REGISTER",                -- leShellLogged
+		[0x019A] = "SERVER_AUTHENTICATE",          -- LanPublicServerLogin
+		[0x019B] = "USER_AUTHENTICATE",            -- leShellLogged
+		[0x019C] = "SERVER_SESSION_CREATE",        -- LanCreateGame
+		[0x019D] = "USER_SESSION_CREATE",          -- leShellSessionCreate
+		[0x019E] = "SERVER_SESSION_JOIN",          -- LanJoinGame
+		[0x019F] = "USER_SESSION_JOIN",            -- leShellSessionJoin
+		[0x01A0] = "SERVER_SESSION_LEAVE",         -- LanTerminateGame
+		[0x01A1] = "USER_SESSION_LEAVE",           -- leShellSessionLeave
+		[0x01A2] = "SERVER_SESSION_LOCK",          -- LanLockServer
+		[0x01A3] = "USER_SESSION_LOCK",            -- leShellSessionLock
+		[0x01A4] = "SERVER_SESSION_INFO",          -- LanPublicServerUpdateMySessionInfo
+		[0x01A5] = "USER_SESSION_INFO",            -- leShellSessionInfo
+		[0x01A6] = "USER_CONNECTED",               -- leShellClientConnected
+		[0x01A7] = "USER_DISCONNECTED",            -- leShellClientDisconnected
+		[0x01A8] = "SERVER_USER_EXIST",            -- LanPublicServerUserExist
+		[0x01A9] = "USER_USER_EXIST",              -- leShellValidEmail
+		[0x01AA] = "SERVER_SESSION_UPDATE",        -- LanSrvSet*
+		[0x01AB] = "SERVER_SESSION_CLIENT_UPDATE", -- LanClSetMyTeam
+		[0x01AC] = "USER_SESSION_CLIENT_UPDATE",   -- 
+		[0x01AD] = "SERVER_VERSION_INFO",          -- LanPublicServerUpdateInfo
+		[0x01AE] = "USER_VERSION_INFO",            -- leShellServerInfo
+		[0x01AF] = "SERVER_SESSION_CLOSE",         -- LanPublicServerCloseSession
+		[0x01B0] = "USER_SESSION_CLOSE",           -- leShellSessionClose
+		[0x01B1] = "SERVER_GET_TOP_USERS",         -- LanPublicServerUpdateTopUsers
+		[0x01B2] = "USER_GET_TOP_USERS",           -- leShellUpdateTopList
+		[0x01B3] = "SERVER_UPDATE_INFO",           -- LanPublicServerRegister
+		[0x01B4] = "USER_UPDATE_INFO",             -- leShellClientUpdateInfo
+		[0x01B5] = "SERVER_SESSION_KICK",          -- LanKillClient
+		[0x01B6] = "USER_SESSION_KICK",            -- 
+		[0x01B7] = "SERVER_SESSION_CLSCORE",       -- LanSrvSetClientScore
+		[0x01B8] = "USER_SESSION_CLSCORE",         -- 
+		[0x01B9] = "SERVER_FORGOT_PSW",            -- LanPublicServerForgotPassword
+		[0x01BA] = "SERVER_SESSION_WRONG_CLOSE",   -- 
+		[0x01BB] = "SERVER_SESSION_PARSER",        -- LanPublicServerSendSessionParser
+		[0x01BC] = "USER_SESSION_PARSER",          -- leSessionParser
+		[0x01BD] = "USER_SESSION_RECREATE",        -- leSessionRecreate
+		[0x01BE] = "USER_SESSION_REJOIN",          -- leSessionRejoin
+		[0x01BF] = "SERVER_PING_TEST",             -- 
+		[0x01C0] = "USER_PING_TEST",               -- 
+		[0x01C1] = "SERVER_SESSION_REJOIN",        -- 
+		[0x01C2] = "SERVER_SELECT_FRIENDS",        -- 
+		[0x01C3] = "USER_SELECT_FRIENDS",          -- leSelectFriends
+		[0x01C4] = "SERVER_UPDATE_FRIENDS",        -- 
+		[0x01C5] = "SERVER_DELETE_FRIENDS",        -- 
+		[0x01C6] = "SERVER_SELECT_CHATS",          -- 
+		[0x01C7] = "USER_SELECT_CHATS",            -- leSelectChats
+		[0x01C8] = "SERVER_INSERT_CHATS",          -- 
+		[0x01C9] = "SERVER_UPDATE_CHATS",          -- 
+		[0x01CA] = "SERVER_DELETE_CHATS",          -- 
+		[0x01CB] = "SERVER_SELECT_CLANS",          -- 
+		[0x01CC] = "USER_SELECT_CLANS",            -- leSelectClans
+		[0x01CD] = "SERVER_INSERT_CLANS",          -- 
+		[0x01CE] = "SERVER_UPDATE_CLANS",          -- 
+		[0x01CF] = "SERVER_DELETE_CLANS",          -- 
+		[0x01D0] = "SERVER_SELECT_MEMBERS",        -- 
+		[0x01D1] = "USER_SELECT_MEMBERS",          -- leSelectMembers
+		[0x01D2] = "SERVER_INSERT_MEMBERS",        -- 
+		[0x01D3] = "SERVER_DELETE_MEMBERS",        -- 
+		[0x01D4] = "SERVER_SELECT_ADMINS",         -- 
+		[0x01D5] = "USER_SELECT_ADMINS",           -- leSelectAdmins
+		[0x01D6] = "SERVER_UPDATE_ADMINS",         -- 
+		[0x01D7] = "SERVER_DELETE_ADMINS",         -- 
+		[0x01D8] = "SERVER_BANNING_ADMINS",        -- 
+		[0x01D9] = "SERVER_RESERV0_ADMINS",        -- 
+		[0x01DA] = "SERVER_RESERV1_ADMINS",        -- 
+		[0x01DB] = "SERVER_RESERV2_ADMINS",        -- 
+		[0x01DC] = "SERVER_SELECT_STATS",          -- 
+		[0x01DD] = "USER_SELECT_STATS",            -- leSelectStats
+		[0x01DE] = "SERVER_UPDATE_STATS",          -- 
+		[0x01DF] = "SERVER_DELETE_STATS",          -- 
+		[0x01E0] = "SERVER_GET_SESSIONS",          -- 
+		[0x01E1] = "USER_GET_SESSIONS",            -- leGetSessions
+		[0x01E2] = "SERVER_PING_LOCK",             -- 
+		[0x01E3] = "SERVER_PING_UNLOCK",           -- 
+		[0x01E4] = "SERVER_CHECKSUM",              -- 
+		[0x01E5] = "USER_CHECKSUM",                -- 
+		[0x01E6] = "USER_CHECKSUM_FAILED",         -- leChecksumFailed
+		[0x0032] = "LAN_PARSER",                   -- LanSendParser
+		[0x0064] = "LAN_CLIENT_INFO",              -- leClientInfo
+		[0x00C8] = "LAN_SERVER_INFO",              -- leServerInfo
+		[0x0456] = "LAN_DO_START",                 -- LanDoStart
+		[0x0457] = "LAN_DO_START_GAME",            -- DoStartGame, leGenerate
+		[0x0460] = "LAN_DO_READY",                 -- LanDoReady
+		[0x0461] = "LAN_DO_READY_DONE",            -- LanDoReadyDone, leReady
+		[0x04B0] = "LAN_RECORD",                   -- 
+	}
+	xcmd.format = function (code)
+		return ("[0x%04X] %s"):format(code, xcmd[code] or "UNKNOWN")
+	end
+	xconst.parser = xconst
+	{
+		[  1] = "LAN_GENERATE",
+		[  2] = "LAN_READYSTART",
+		[  3] = "LAN_START",
+		[  4] = "LAN_ROOM_READY",
+		[  5] = "LAN_ROOM_START",
+		[  6] = "LAN_ROOM_CLIENT_CHANGES",
+		[  7] = "LAN_GAME_READY",
+		[  8] = "LAN_GAME_ANSWER_READY",
+		[  9] = "LAN_GAME_START",
+		[ 10] = "LAN_GAME_SURRENDER",
+		[ 11] = "LAN_GAME_SURRENDER_CONFIRM",
+		[ 12] = "LAN_GAME_SERVER_LEAVE",
+		[ 13] = "LAN_GAME_SESSION_RESULTS",
+		[ 14] = "LAN_GAME_SYNC_REQUEST",
+		[ 15] = "LAN_GAME_SYNC_DATA",
+		[ 16] = "LAN_GAME_SYNC_GAMETIME",
+		[ 17] = "LAN_GAME_SYNC_ALIVE",
+		[100] = "LAN_ROOM_SERVER_DATASYNC",
+		[101] = "LAN_ROOM_SERVER_DATACHANGE",
+		[102] = "LAN_ROOM_CLIENT_DATACHANGE",
+		[103] = "LAN_ROOM_CLIENT_LEAVE",
+		[200] = "LAN_MODS_MODSYNC_REQUEST",
+		[201] = "LAN_MODS_MODSYNC_PARSER",
+		[202] = "LAN_MODS_CHECKSUM_REQUEST",
+		[203] = "LAN_MODS_CHECKSUM_ANSWER",
+		[204] = "LAN_MODS_CHECKSUM_REQUESTCANJOIN",
+		[205] = "LAN_MODS_CHECKSUM_ANSWERCANJOIN",
+		[206] = "LAN_MODS_CHECKSUM_ANSWERCANNOTJOIN",
+		[300] = "LAN_ADVISER_CLIENT_DATACHANGE",
+	}
+	xconst.player_victorystate = xconst
+	{
+		[0] = "none",
+		[1] = "win",
+		[2] = "lose",
+	}
+	xconst.spectator_countryid = -2
+end
+
+-- // xkeys // --
+do
+	local log = xlog("xkeys")
+	local keystore = xstore.load("keys")
+	if type(keystore) == "function" then
+		xkeys = keystore
+	elseif type(keystore) == "table" then
+		local keys = nil
+		if #keystore == 0 then
+			keys = keystore
+		else
+			keys = {}
+			for _, key in ipairs(keystore) do
+				keys[key] = true
+			end
+		end
+		xkeys = function (cdkey, email)
+			return keys[cdkey] and true or false
+		end
+	else
+		log("info", "disabled")
+		xkeys = function (cdkey, email)
+			return true
+		end
+	end
+	keystore = nil
+end
+
+-- // xparser // --
+do
+	local log = xlog("xparser")
+	xparser = xclass
+	{
+		__create = function (self, key, value)
+			self.key = assert(key, "no key")
+			self.value = assert(value, "no value")
+			return self
+		end,
+		count = function (self)
+			return #self
+		end,
+		pairs = function (self)
+			return ipairs(self)
+		end,
+		append = function (self, node)
+			table.insert(self, node)
+			return node
+		end,
+		find = function (self, key)
+			for _, node in self:pairs() do
+				if node.key == key then
+					return node
+				end
+			end
+			return nil
+		end,
+		add = function (self, key, value)
+			return self:append(xparser(key, value))
+		end,
+		get = function (self, key, default)
+			local node = self:find(key)
+			if node then
+				return node.value
+			end
+			return default
+		end,
+		set = function (self, key, value)
+			local node = self:find(key)
+			if node then
+				node.value = value
+				return node
+			end
+			return self:add(key, value)
+		end,
+		remove = function (self, key)
+			local i = self:count()
+			while i > 0 do
+				if self[i].key == key then
+					table.remove(self, i)
+				end
+				i = i - 1
+			end
+		end,
+		dump = function (self, flog)
+			flog = flog or log
+			if not flog:check("debug") then
+				return
+			end
+			local function do_dump(parser)
+				flog("debug", "key = %q, value = %q", parser.key, parser.value)
+				flog:inc(2)
+				for _, node in parser:pairs() do
+					do_dump(node)
+				end
+				flog:dec(2)
+			end
+			return do_dump(self)
+		end,
+	}
+	null_parser = xparser("", "")
+end
+
+-- // xpack // --
+do
+	local log = xlog("xpack")
+	xpack = xclass
+	{
+		formats =
+		{
+			["1"] = "byte",
+			["b"] = "boolean",
+			["d"] = "datetime",
+			["t"] = "timestamp",
+			["s"] = "byte_string",
+			["w"] = "word_string",
+			["z"] = "dword_string",
+			["v"] = "version",
+			["p"] = "parser",
+			["q"] = "parser_with_size",
+		},
+		__create = function (self, buffer, position)
+			self.buffer = buffer or {}
+			self.position = buffer and (position or 1) or nil
+			return self
+		end,
+		reader = function (self, buffer, position)
+			self.buffer = buffer or self:get_buffer()
+			self.position = position or 1
+			return self
+		end,
+		get_buffer = function (self)
+			local buffer = self.buffer
+			if type(buffer) == "table" then
+				buffer = table.concat(buffer)
+			end
+			return buffer
+		end,
+		remain = function (self)
+			return math.max(0, #self.buffer - self.position + 1)
+		end,
+		read_check = function (self, size)
+			local remain = self:remain()
+			if size > remain then
+				log("error", "read_check: size=%d, remain=%d", size, remain)
+				return false
+			end
+			return true
+		end,
+		read_all = function (self)
+			local result = self.buffer:sub(self.position)
+			self.position = #self.buffer + 1
+			return result
+		end,
+		read_buffer = function (self, size)
+			if not self:read_check(size) then
+				return nil
+			end
+			self.position = self.position + size
+			return self.buffer:sub(self.position - size, self.position - 1)
+		end,
+		read_number = function (self, size)
+			if not self:read_check(size) then
+				return nil
+			end
+			self.position = self.position + size
+			local byte = { self.buffer:byte(self.position - size, self.position - 1) }
+			local result = 0
+			for i = size, 1, -1 do
+				result = result * 256 + byte[i]
+			end
+			return result
+		end,
+		read_byte = function (self)
+			if not self:read_check(1) then
+				return nil
+			end
+			self.position = self.position + 1
+			return self.buffer:byte(self.position - 1)
+		end,
+		read_boolean = function (self)
+			local byte = self:read_byte()
+			if byte == nil then
+				return nil
+			end
+			return byte ~= 0
+		end,
+		read_word = function (self)
+			return self:read_number(2)
+		end,
+		read_dword = function (self)
+			return self:read_number(4)
+		end,
+		read_datetime = function (self)
+			if not self:read_check(8) then
+				return nil
+			end
+			self.position = self.position + 8
+			local byte = { self.buffer:byte(self.position - 8, self.position - 1) }
+			local sign = (byte[8] < 128)
+			local exponent = (byte[8] % 128) * 16 + math.floor(byte[7] / 16)
+			local mantissa = byte[7] % 16
+			for i = 6, 1, -1 do
+				mantissa = mantissa * 256 + byte[i]
+			end
+			if (mantissa == 0 and exponent == 0) or (sign == false) or (exponent == 2047) then
+				return 0
+			end
+			mantissa = 1 + math.ldexp(mantissa, -52)
+			return math.ldexp(mantissa, exponent - 1023)
+		end,
+		read_timestamp = function (self)
+			local datetime = self:read_datetime()
+			if datetime == nil then
+				return nil
+			end
+			return math.max(0, (datetime - 25569.0) * 86400.0)
+		end,
+		read_string = function (self, len_size)
+			local len = self:read_number(len_size)
+			if len == nil then
+				return nil
+			end
+			return self:read_buffer(len)
+		end,
+		read_byte_string = function (self)
+			return self:read_string(1)
+		end,
+		read_word_string = function (self)
+			return self:read_string(2)
+		end,
+		read_dword_string = function (self)
+			return self:read_string(4)
+		end,
+		read_version = function (self)
+			local str = self:read_byte_string()
+			if str == nil then
+				return nil
+			end
+			local result = 0
+			for part in str:gmatch("[0-9]+") do
+				result = result * 256 + tonumber(part)
+			end
+			return result
+		end,
+		read_parser = function (self)
+			if self:remain() == 0 then
+				return null_parser
+			end
+			local key, value, count = self:read("zz4")
+			if key == nil then
+				return nil
+			end
+			local parser = xparser(key, value)
+			for _ = 1, count do
+				local node = self:read_parser()
+				if node == nil then
+					return nil
+				end
+				parser:append(node)
+			end
+			return parser
+		end,
+		read_parser_with_size = function (self)
+			local buffer = self:read_dword_string()
+			if buffer == nil then
+				return nil
+			end
+			return xpack(buffer):read_parser()
+		end,
+		read_array = function (self, format)
+			local array = {}
+			for i = 1, #format do
+				local fmt, value = format:sub(i, i), nil
+				local ftype = self.formats[fmt]
+				if ftype then
+					value = self["read_" .. ftype](self)
+				else
+					fmt = assert(tonumber(fmt), "invalid format")
+					value = self:read_number(fmt)
+				end
+				if value == nil then
+					return nil
+				end
+				array[i] = value
+			end
+			return array
+		end,
+		read_object = function (self, object, format, ...)
+			local values = self:read_array(format)
+			if values == nil then
+				return nil
+			end
+			for index, value in ipairs(values) do
+				local key = assert(select(index, ...), "no more keys")
+				object[key] = value
+			end
+			return object
+		end,
+		read_objects = function (self, objects, format, ...)
+			local count = self:read_dword()
+			if count == nil then
+				return nil
+			end
+			for _ = 1, count do
+				local object = self:read_object({}, format, ...)
+				if object == nil then
+					return nil
+				end
+				table.insert(objects, object)
+			end
+			return objects
+		end,
+		read = function (self, format)
+			local array = self:read_array(format)
+			if array == nil then
+				return nil
+			end
+			return unpack(array)
+		end,
+		write_buffer = function (self, buffer)
+			assert(type(buffer) == "string", "not a string buffer")
+			table.insert(self.buffer, buffer)
+			return self
+		end,
+		write_number = function (self, size, value)
+			assert(type(value) == "number", "not a numeric value")
+			local frac = nil
+			for _ = 1, size do
+				value, frac = math.modf(value / 256)
+				table.insert(self.buffer, string.char(frac * 256))
+			end
+			return self
+		end,
+		write_byte = function (self, value)
+			assert(type(value) == "number", "not a numeric value")
+			table.insert(self.buffer, string.char(value))
+			return self
+		end,
+		write_boolean = function (self, value)
+			assert(type(value) == "boolean", "not a boolean value")
+			return self:write_byte(value and 1 or 0)
+		end,
+		write_word = function (self, value)
+			return self:write_number(2, value)
+		end,
+		write_dword = function (self, value)
+			return self:write_number(4, value)
+		end,
+		write_datetime = function (self, value)
+			assert(type(value) == "number", "not a numeric value")
+			if value < 0 or value == math.huge or value ~= value then
+				value = 0
+			end
+			local mantissa, exponent = 0, 0
+			if value ~= 0 then
+				mantissa, exponent = math.frexp(value)
+				mantissa = math.floor(0.5 + math.ldexp(mantissa * 2 - 1, 52))
+				exponent = exponent - 1 + 1023
+			end
+			local byte = {}
+			for _ = 1, 6 do
+				mantissa, value = math.modf(mantissa / 256)
+				table.insert(byte, value * 256)
+			end
+			table.insert(byte, mantissa + exponent % 16 * 16)
+			table.insert(byte, math.floor(exponent / 16))
+			table.insert(self.buffer, string.char(unpack(byte)))
+			return self
+		end,
+		write_timestamp = function (self, value)
+			assert(type(value) == "number", "not a numeric value")
+			return self:write_datetime(value / 86400.0 + 25569.0)
+		end,
+		write_string = function (self, len_size, value)
+			assert(type(value) == "string", "not a string value")
+			self:write_number(len_size, #value)
+			return self:write_buffer(value)
+		end,
+		write_byte_string = function (self, value)
+			return self:write_string(1, value)
+		end,
+		write_word_string = function (self, value)
+			return self:write_string(2, value)
+		end,
+		write_dword_string = function (self, value)
+			return self:write_string(4, value)
+		end,
+		write_version = function (self, value)
+			assert(type(value) == "number", "not a numeric value")
+			local version, frac = {}, nil
+			while value > 0 do
+				value, frac = math.modf(value / 256)
+				table.insert(version, 1, tostring(frac * 256))
+			end
+			return self:write_byte_string(table.concat(version, "."))
+		end,
+		write_parser = function (self, parser)
+			assert(type(parser) == "table" and parser.__class == xparser, "not a parser value")
+			if parser ~= null_parser then
+				self:write("zz4",
+					tostring(parser.key),
+					tostring(parser.value),
+					parser:count())
+				for _, node in parser:pairs() do
+					self:write_parser(node)
+				end
+			end
+			return self
+		end,
+		write_parser_with_size = function (self, parser)
+			local buffer = xpack()
+				:write_parser(parser)
+				:get_buffer()
+			return self:write_dword_string(buffer)
+		end,
+		write_array = function (self, format, array)
+			for i = 1, #format do
+				local fmt, value = format:sub(i, i), array[i]
+				local ftype = self.formats[fmt]
+				if ftype then
+					self["write_" .. ftype](self, value)
+				else
+					fmt = assert(tonumber(fmt), "invalid format")
+					self:write_number(fmt, value)
+				end
+			end
+			return self
+		end,
+		write_object = function (self, object, format, ...)
+			local array = {}
+			for i = 1, select("#", ...) do
+				array[i] = object[select(i, ...)]
+			end
+			return self:write_array(format, array)
+		end,
+		write_objects = function (self, objects, format, ...)
+			local count = 0
+			for _ in pairs(objects) do
+				count = count + 1
+			end
+			self:write_dword(count)
+			for _, object in pairs(objects) do
+				self:write_object(object, format, ...)
+			end
+			return self
+		end,
+		write = function (self, format, ...)
+			return self:write_array(format, {...})
+		end,
+	}
+end
+
+-- // xpackage // --
+do
+	local log = xlog("xpackage")
+	xpackage = xclass
+	{
+		__parent = xpack,
+		__create = function (self, code, id_from, id_to, buffer)
+			self = xpack.__create(self, buffer)
+			self.code = assert(code, "no code")
+			self.id_from = assert(id_from, "no id_from")
+			self.id_to = assert(id_to, "no id_to")
+			return self
+		end,
+		get = function (self)
+			local payload = self:get_buffer()
+			return xpack()
+				:write("4244", #payload, self.code, self.id_from, self.id_to)
+				:write_buffer(payload)
+				:get_buffer()
+		end,
+		transmit = function (self, client)
+			self:dump_head(client.log)
+			client.socket:send(self:get())
+			return self
+		end,
+		broadcast = function (self, client)
+			return client.server:broadcast(self)
+		end,
+		dispatch = function (self, client)
+			return client.server:dispatch(self)
+		end,
+		session_broadcast = function (self, client)
+			return client.session:broadcast(self)
+		end,
+		session_dispatch = function (self, client)
+			return client.session:dispatch(self)
+		end,
+		dump_head = function (self, flog)
+			flog = flog or log
+			return flog("debug", "%s  from=%d to=%d",
+				xcmd.format(self.code), self.id_from, self.id_to)
+		end,
+		dump_payload = function (self, flog)
+			flog = flog or log
+			if not flog:check("debug") then
+				return
+			end
+			local pos = 1
+			local buffer = self:get_buffer()
+			while pos <= #buffer do
+				local line = buffer:sub(pos, pos + 16 - 1)
+				local hex = 
+					line:gsub(".", function (c) return ("%02X "):format(c:byte()) end)
+					..
+					("   "):rep(#buffer - pos < 17 and 15 - (#buffer - pos) or 0)
+				flog("debug", "%04X | %s %s| %s",
+					pos - 1,
+					hex:sub(1, 24),
+					hex:sub(25),
+					(line:gsub("[^\32-\126]", "?")))
+				pos = pos + 16
+			end
+		end,
+	}
+end
+
+-- // xpacket // --
+do
+	local log = xlog("xpacket")
+	xpacket = xclass
+	{
+		__parent = xpackage,
+		receive = function (class, socket)
+			local head = socket:receive(4 + 2 + 4 + 4)
+			if not head then
+				return nil
+			end
+			local payload_length, code, id_from, id_to = xpack(head):read("4244")
+			local payload = socket:receive(payload_length)
+			if not payload then
+				return nil
+			end
+			return class(code, id_from, id_to, payload)
+		end,
+		parse = function (self, vcore, vdata)
+			local read_proc = self[self.code]
+			if not read_proc then
+				log("warn", "%s: not implemented", xcmd.format(self.code))
+				return nil
+			end
+			self.vcore = vcore
+			self.vdata = vdata
+			self.position = 1
+			local result = read_proc(self, {})
+			if (not result) or (self:remain() > 0) then
+				log("error", "%s: parse error", xcmd.format(self.code))
+				return nil
+			end
+			result.code = self.code
+			result.id_from = self.id_from
+			result.id_to = self.id_to
+			return result
+		end,
+		read_clients = function (self, result, format, ...)
+			local clients = self:read_objects({}, format, ...)
+			if not clients then
+				return nil
+			end
+			result.clients = clients
+			return result
+		end,
+		read_server_clients = function (self, result)
+			result.clients = {}
+			while true do
+				local id = self:read_dword()
+				if id == nil then
+					return nil
+				elseif id == 0 then
+					break
+				end
+				local client = self:read_object({id = id}, "1sss",
+					"states",
+					"nickname",
+					"country",
+					"info")
+				if not client then
+					return nil
+				end
+				if self.vdata >= 0x00020100 then
+					if not self:read_object(client, "444td",
+						"score",
+						"games_played",
+						"games_win",
+						"last_game",
+						"pingtime")
+					then
+						return nil
+					end
+				end
+				table.insert(result.clients, client)
+			end
+			return result
+		end,
+		read_server_sessions = function (self, result)
+			result.sessions = {}
+			while true do
+				local master_id = self:read_dword()
+				if master_id == nil then
+					return nil
+				elseif master_id == 0 then
+					break
+				end
+				local session = self:read_object({master_id = master_id}, "4ss4b1",
+					"max_players",
+					"gamename",
+					"mapname",
+					"money",
+					"fog_of_war",
+					"battlefield")
+				if not session then
+					return nil
+				end
+				if not self:read_clients(session, "4",
+					"id")
+				then
+					return nil
+				end
+				table.insert(result.sessions, session)
+			end
+			return result
+		end,
+		read_authenticate = function (self, result)
+			result.error_code = self:read_byte()
+			if result.error_code == nil then
+				return nil
+			end
+			if result.error_code ~= 0 then
+				return result
+			end
+			if not self:read_object(result, "ss444ts",
+				"nickname",
+				"country",
+				"score",
+				"games_played",
+				"games_win",
+				"last_game",
+				"info")
+			then
+				return nil
+			end
+			if not self:read_server_clients(result) then
+				return nil
+			end
+			return self:read_server_sessions(result)
+		end,
+		[xcmd.PING] = function (self, result)
+			if result.id_from ~= 0 then
+				return self:read_object(result, "d",
+					"pingtime")
+			else
+				return self:read_clients(result, "4d",
+					"id",
+					"pingtime")
+			end
+		end,
+		[xcmd.SERVER_CLIENTINFO] = function (self, result)
+			return self:read_object(result, "4",
+				"id")
+		end,
+		[xcmd.USER_CLIENTINFO] = function (self, result)
+			if not self:read_object(result, "41ss444ts",
+				"id",
+				"states",
+				"nickname",
+				"country",
+				"score",
+				"games_played",
+				"games_win",
+				"last_game",
+				"info")
+			then
+				return nil
+			end
+			if self.vdata >= 0x00020100 then
+				if not self:read_object(result, "d",
+					"pingtime")
+				then
+					return nil
+				end
+			end
+			return result
+		end,
+		[xcmd.SERVER_SESSION_MSG] = function (self, result)
+			return self:read_object(result, "s",
+				"message")
+		end,
+		[xcmd.USER_SESSION_MSG] = function (self, result)
+			return self:read_object(result, "s",
+				"message")
+		end,
+		[xcmd.SERVER_MESSAGE] = function (self, result)
+			return self:read_object(result, "s",
+				"message")
+		end,
+		[xcmd.USER_MESSAGE] = function (self, result)
+			return self:read_object(result, "s",
+				"message")
+		end,
+		[xcmd.SERVER_REGISTER] = function (self, result)
+			return self:read_object(result, "vvssssss",
+				"vcore",
+				"vdata",
+				"email",
+				"password",
+				"cdkey",
+				"nickname",
+				"country",
+				"info")
+		end,
+		[xcmd.USER_REGISTER] = function (self, result)
+			return self:read_authenticate(result)
+		end,
+		[xcmd.SERVER_AUTHENTICATE] = function (self, result)
+			return self:read_object(result, "vvsss",
+				"vcore",
+				"vdata",
+				"email",
+				"password",
+				"cdkey")
+		end,
+		[xcmd.USER_AUTHENTICATE] = function (self, result)
+			return self:read_authenticate(result)
+		end,
+		[xcmd.SERVER_SESSION_CREATE] = function (self, result)
+			return self:read_object(result, "4sss4b1",
+				"max_players",
+				"password",
+				"gamename",
+				"mapname",
+				"money",
+				"fog_of_war",
+				"battlefield")
+		end,
+		[xcmd.USER_SESSION_CREATE] = function (self, result)
+			return self:read_object(result, "14ss4b1",
+				"states",
+				"max_players",
+				"gamename",
+				"mapname",
+				"money",
+				"fog_of_war",
+				"battlefield")
+		end,
+		[xcmd.SERVER_SESSION_JOIN] = function (self, result)
+			return self:read_object(result, "4",
+				"master_id")
+		end,
+		[xcmd.USER_SESSION_JOIN] = function (self, result)
+			return self:read_object(result, "41",
+				"master_id",
+				"states")
+		end,
+		[xcmd.SERVER_SESSION_LEAVE] = function (self, result)
+			return result
+		end,
+		[xcmd.USER_SESSION_LEAVE] = function (self, result)
+			if not self:read_object(result, "b", "is_master") then
+				return nil
+			end
+			return self:read_clients(result, "41",
+				"id",
+				"states")
+		end,
+		[xcmd.SERVER_SESSION_LOCK] = function (self, result)
+			return self:read_clients(result, "41",
+				"id",
+				"team")
+		end,
+		[xcmd.USER_SESSION_LOCK] = function (self, result)
+			local count = self:read_dword()
+			if count == nil then
+				return nil
+			end
+			local clients = {}
+			for _ = 1, count do
+				local id = self:read_dword()
+				if id == nil then
+					return nil
+				elseif id == 0 then
+					if not self:read_object(result, "4",
+						"session_id")
+					then
+						return nil
+					end
+				else
+					local client = {id = id}
+					if not self:read_object(client, "1",
+						"states")
+					then
+						return nil
+					end
+					table.insert(clients, client)
+				end
+			end
+			result.clients = clients
+			return result
+		end,
+		[xcmd.SERVER_SESSION_INFO] = function (self, result)
+			return result
+		end,
+		[xcmd.USER_SESSION_INFO] = function (self, result)
+			if not self:read_object(result, "4ss4b1",
+				"max_players",
+				"gamename",
+				"mapname",
+				"money",
+				"fog_of_war",
+				"battlefield")
+			then
+				return nil
+			end
+			return self:read_clients(result, "41",
+				"id",
+				"states")
+		end,
+		[xcmd.USER_CONNECTED] = function (self, result)
+			if not self:read_object(result, "sss1",
+				"nickname",
+				"country",
+				"info",
+				"states")
+			then
+				return nil
+			end
+			if self.vdata >= 0x00020100 then
+				if not self:read_object(result, "444td",
+					"score",
+					"games_played",
+					"games_win",
+					"last_game",
+					"pingtime")
+				then
+					return nil
+				end
+			end
+			return result
+		end,
+		[xcmd.USER_DISCONNECTED] = function (self, result)
+			return result
+		end,
+		[xcmd.SERVER_USER_EXIST] = function (self, result)
+			return self:read_object(result, "s",
+				"email")
+		end,
+		[xcmd.USER_USER_EXIST] = function (self, result)
+			return self:read_object(result, "sb",
+				"email",
+				"exist")
+		end,
+		[xcmd.SERVER_SESSION_UPDATE] = function (self, result)
+			return self:read_object(result, "ss4b1",
+				"gamename",
+				"mapname",
+				"money",
+				"fog_of_war",
+				"battlefield")
+		end,
+		[xcmd.SERVER_SESSION_CLIENT_UPDATE] = function (self, result)
+			return self:read_object(result, "1",
+				"team")
+		end,
+		[xcmd.USER_SESSION_CLIENT_UPDATE] = function (self, result)
+			return self:read_object(result, "1",
+				"team")
+		end,
+		[xcmd.SERVER_VERSION_INFO] = function (self, result)
+			return self:read_object(result, "v",
+				"vdata")
+		end,
+		[xcmd.USER_VERSION_INFO] = function (self, result)
+			return self:read_object(result, "vvq",
+				"vcore",
+				"vdata",
+				"parser")
+		end,
+		[xcmd.SERVER_SESSION_CLOSE] = function (self, result)
+			return result
+		end,
+		[xcmd.USER_SESSION_CLOSE] = function (self, result)
+			if not self:read_object(result, "t",
+				"timestamp")
+			then
+				return nil
+			end
+			return self:read_clients(result, "44",
+				"id",
+				"score")
+		end,
+		[xcmd.SERVER_GET_TOP_USERS] = function (self, result)
+			return self:read_object(result, "4",
+				"count")
+		end,
+		[xcmd.USER_GET_TOP_USERS] = function (self, result)
+			result.clients = {}
+			while true do
+				local mark = self:read_byte()
+				if mark == nil then
+					return nil
+				elseif mark == 0 then
+					break
+				end
+				local client = self:read_object({}, "ss444t",
+					"nickname",
+					"country",
+					"score",
+					"games_played",
+					"games_win",
+					"last_game")
+				if not client then
+					return nil
+				end
+				if mark >= 2 then
+					if not self:read_object(client, "4",
+						"id")
+					then
+						return nil
+					end
+				end
+				table.insert(result.clients, client)
+			end
+			return result
+		end,
+		[xcmd.SERVER_UPDATE_INFO] = function (self, result)
+			return self:read_object(result, "ssss",
+				"password",
+				"nickname",
+				"country",
+				"info")
+		end,
+		[xcmd.USER_UPDATE_INFO] = function (self, result)
+			if not self:read_object(result, "sss1",
+				"nickname",
+				"country",
+				"info",
+				"states")
+			then
+				return nil
+			end
+			if self.vdata >= 0x00020100 then
+				if not self:read_object(result, "444td",
+					"score",
+					"games_played",
+					"games_win",
+					"last_game",
+					"pingtime")
+				then
+					return nil
+				end
+			end
+			return result
+		end,
+		[xcmd.SERVER_SESSION_KICK] = function (self, result)
+			return self:read_object(result, "4",
+				"id")
+		end,
+		[xcmd.USER_SESSION_KICK] = function (self, result)
+			return self:read_object(result, "4",
+				"id")
+		end,
+		[xcmd.SERVER_SESSION_CLSCORE] = function (self, result)
+			return self:read_object(result, "44",
+				"id",
+				"score")
+		end,
+		[xcmd.USER_SESSION_CLSCORE] = function (self, result)
+			return self:read_object(result, "44",
+				"id",
+				"score")
+		end,
+		[xcmd.SERVER_FORGOT_PSW] = function (self, result)
+			return self:read_object(result, "s",
+				"email")
+		end,
+		[xcmd.SERVER_SESSION_PARSER] = function (self, result)
+			return self:read_object(result, "4p",
+				"parser_id",
+				"parser")
+		end,
+		[xcmd.USER_SESSION_PARSER] = function (self, result)
+			return self:read_object(result, "4p4",
+				"parser_id",
+				"parser",
+				"unk_dw")
+		end,
+		[xcmd.USER_SESSION_RECREATE] = function (self, result)
+			return self:read_object(result, "q",
+				"parser")
+		end,
+		[xcmd.USER_SESSION_REJOIN] = function (self, result)
+			return result
+		end,
+		[xcmd.SERVER_GET_SESSIONS] = function (self, result)
+			return result
+		end,
+		[xcmd.USER_GET_SESSIONS] = function (self, result)
+			return self:read_server_sessions(result)
+		end,
+		[xcmd.SERVER_PING_LOCK] = function (self, result)
+			return result
+		end,
+		[xcmd.SERVER_PING_UNLOCK] = function (self, result)
+			return result
+		end,
+		[xcmd.SERVER_CHECKSUM] = function (self, result)
+			return self:read_object(result, "w",
+				"checksum")
+		end,
+		[xcmd.USER_CHECKSUM] = function (self, result)
+			return result
+		end,
+		[xcmd.LAN_PARSER] = function (self, result)
+			return self:read_object(result, "4p",
+				"parser_id",
+				"parser")
+		end,
+		[xcmd.LAN_CLIENT_INFO] = function (self, result)
+			return self:read_object(result, "wwb41411",
+				"player",
+				"nickname",
+				"spectator",
+				"id",
+				"team",
+				"score",
+				"field_1C",
+				"field_1D")
+		end,
+		[xcmd.LAN_SERVER_INFO] = function (self, result)
+			return self:read_object(result, "ww44wb1b4",
+				"gamename",
+				"mapname",
+				"max_players",
+				"protocol_ver",
+				"host",
+				"secured",
+				"battlefield",
+				"fog_of_war",
+				"money")
+		end,
+	}
+end
+
+-- // xregister // --
+do
+	local log = xlog("xregister")
+	local function assign(client, id, account)
+		client.id = id
+		client.email = account.email
+		client.password = account.password
+		client.cdkey = account.cdkey
+		client.nickname = account.nickname
+		client.country = account.country
+		client.info = account.info
+		client.score = account.score
+		client.games_played = account.games_played
+		client.games_win = account.games_win
+		client.last_game = account.last_game
+		client.banned = account.banned
+	end
+	xregister = xclass
+	{
+		__create = function ()
+			local self = xstore.load("register", {})
+			setmetatable(self, xregister.__objmt)
+			local maxid = 0
+			while true do
+				local email, account
+				for em, acc in pairs(self) do
+					if type(em) == "string" then
+						email = em
+						account = acc
+						break
+					elseif maxid < em then
+						maxid = em
+					end
+				end
+				if not email then
+					break
+				end
+				self[email] = nil
+				account.email = email
+				self[account.id] = account
+				account.id = nil
+				if account.blocked ~= nil then
+					account.banned = account.blocked
+					account.blocked = nil
+				end
+			end
+			for id = 1, maxid do
+				if type(self[id]) ~= "table" then
+					self[id] = false
+				end
+			end
+			return self
+		end,
+		save = function (self)
+			return xstore.save("register", self)
+		end,
+		pairs = function (self)
+			local iter, state, var = ipairs(self)
+			local function iter1(state, var)
+				local id, account = iter(state, var)
+				if not id then
+					return nil, nil
+				elseif account then
+					return id, account
+				end
+				return iter1(state, id)
+			end
+			return iter1, state, var
+		end,
+		find = function (self, email)
+			if self[email] then
+				return email, self[email]
+			else
+				email = email:lower()
+				for id, account in self:pairs() do
+					if account.email == email then
+						return id, account
+					end
+				end
+			end
+			return nil, nil
+		end,
+		exist = function (self, email)
+			return self:find(email) ~= nil
+		end,
+		new = function (self, client, request)
+			local email = assert(request.email)
+			if self:exist(email) then
+				return false
+			end
+			log("info", "registering new user: %s", email)
+			local account =
+			{
+				email = email:lower(),
+				password = assert(request.password),
+				cdkey = assert(request.cdkey),
+				nickname = assert(request.nickname),
+				country = assert(request.country),
+				info = assert(request.info),
+				score = 0,
+				games_played = 0,
+				games_win = 0,
+				last_game = 0,
+				banned = false,
+			}
+			table.insert(self, account)
+			self:save()
+			assign(client, #self, account)
+			return true
+		end,
+		get = function (self, client, email)
+			local id, account = self:find(email)
+			if not id then
+				return false
+			end
+			assign(client, id, account)
+			return true
+		end,
+		update = function (self, client, do_not_save)
+			local id, account = self:find(client.id)
+			if not id then
+				return false
+			end
+			account.password = client.password
+			account.nickname = client.nickname
+			account.country = client.country
+			account.info = client.info
+			account.score = client.score
+			account.games_played = client.games_played
+			account.games_win = client.games_win
+			account.last_game = client.last_game
+			if not do_not_save then
+				self:save()
+			end
+			return true
+		end,
+		remove = function (self, email)
+			local id = self:find(email)
+			if not id then
+				return false
+			end
+			self[id] = false
+			self:save()
+			return true
+		end,
+		ban = function (self, email, banned)
+			local id, account = self:find(email)
+			if not id then
+				return false
+			end
+			account.banned = banned
+			self:save()
+			return true
+		end,
+	}
+	register = xregister()
+end
+
+-- // xclient // --
+do
+	local state_index =
+	{
+		online = 0,
+		session = 1,
+		master = 2,
+		played = 3,
+	}
+	xclient = xclass
+	{
+		__create = function (self, socket)
+			local host, port = socket:getpeername()
+			self.log = xlog("xclient", host)
+			self.log("debug", "creating new client")
+			self.host = host
+			self.port = port
+			self.socket = socket
+			self.id = 0
+			self.cid = -1
+			self.team = 0
+			self.states = 0
+			self.vcore = 0
+			self.vdata = 0
+			self.pingtime = 0
+			self.email = ""
+			self.password = ""
+			self.cdkey = ""
+			self.nickname = ""
+			self.country = ""
+			self.info = ""
+			self.score = 0
+			self.games_played = 0
+			self.games_win = 0
+			self.last_game = 0
+			self.banned = false
+			self.score_updated = nil
+			return self
+		end,
+		set_state = function (self, state, enabled)
+			local index = assert(state_index[state], "invalid client state")
+			local flag = math.pow(2, index)
+			local update = false
+			if enabled then
+				update = (self.states % (2 * flag) < flag)
+				if update then
+					self.states = self.states + flag
+				end
+			else
+				update = (self.states % (2 * flag) >= flag)
+				if update then
+					self.states = self.states - flag
+				end
+			end
+			if update then
+				self.log("debug", "state changed: %s=%s", state, tostring(enabled))
+			end
+		end,
+		get_state = function (self, state)
+			local index = assert(state_index[state], "invalid client state")
+			local flag = math.pow(2, index)
+			return self.states % (2 * flag) >= flag
+		end,
+	}
+end
+
+-- // xclients // --
+do
+	local log = xlog("xclients")
+	xclients = xclass
+	{
+		__create = function (self)
+			self.clients = {}
+			return self
+		end,
+		get_clients_count = function (self)
+			local count = 0
+			for _ in pairs(self.clients) do
+				count = count + 1
+			end
+			return count
+		end,
+		check_client = function (self, client_id)
+			if self.clients[client_id] then
+				return true
+			end
+			log("debug", "client not found: %d", client_id)
+			return false
+		end,
+		broadcast = function (self, package)
+			package:dump_head()
+			local buffer = package:get()
+			for _, client in pairs(self.clients) do
+				client.socket:send(buffer)
+			end
+			return package
+		end,
+		dispatch = function (self, package)
+			if package.id_to == 0 then
+				return self:broadcast(package)
+			end
+			if self:check_client(package.id_to) then
+				package:transmit(self.clients[package.id_to])
+			end
+			return package
+		end,
+	}
+end
+
+-- // xsocket // --
+do
+	local socket = require "socket"
+	local log = xlog("xsocket")
+	local sendt = {}
+	local recvt = {}
+	local slept = {}
+	local wrapped = setmetatable({}, {__mode = "kv"})
+	local wrapper wrapper = setmetatable(
+	{
+		error = function (self, err)
+			if err ~= "closed" then
+				log("debug", "socket error: %s", err)
+			end
+			self:close()
+			return nil, err
+		end,
+		bind = function (self, host, port)
+			log("debug", "socket bind: %s:%s", host, port)
+			return self.sock:bind(host, port)
+		end,
+		listen = function (self, backlog)
+			local ok, err = self.sock:listen(backlog)
+			if not ok then
+				return self:error(err)
+			end
+			self.closed = false
+			return true
+		end,
+		accept = function (self)
+			if self.closed then
+				return nil, "closed"
+			end
+			while true do
+				coroutine.yield(self.sock, recvt)
+				local client, err = self.sock:accept()
+				if client then
+					client:setoption("tcp-nodelay", true)
+					return wrapper(client, false)
+				elseif err ~= "timeout" then
+					return self:error(err)
+				end
+			end
+		end,
+		connect_unix = function (self, host, port)
+			while true do
+				local ok, err = self.sock:connect(host, port)
+				if ok or err == "already connected" then
+					self.closed = false
+					return true
+				elseif err == "timeout" or err == "Operation already in progress" then
+					coroutine.yield(self.sock, sendt)
+				else
+					return self:error(err)
+				end
+			end
+		end,
+		connect_windows = function (self, host, port)
+			local first_timeout = true
+			while true do
+				local ok, err = self.sock:connect(host, port)
+				if ok or err == "already connected" then
+					self.closed = false
+					return true
+				elseif err == "Operation already in progress" then
+					xsocket.sleep(0.1)
+				elseif err == "timeout" and first_timeout then
+					first_timeout = false
+					xsocket.sleep(0.1)
+				elseif err == "timeout" then
+					return self:error("connection refused")
+				else
+					return self:error(err)
+				end
+			end
+		end,
+		send = function (self, data)
+			if self.closed then
+				return nil, "closed"
+			end
+			self.writebuf = self.writebuf .. data
+			while #self.writebuf > 0 do
+				coroutine.yield(self.sock, sendt)
+				if #self.writebuf == 0 then
+					break
+				end
+				local sent, err, last = self.sock:send(self.writebuf)
+				if sent then
+					self.writebuf = self.writebuf:sub(sent + 1)
+				elseif err == "timeout" then
+					self.writebuf = self.writebuf:sub(last + 1)
+				else
+					return self:error(err)
+				end
+			end
+			return true
+		end,
+		receive = function (self, size)
+			if self.closed then
+				return nil, "closed"
+			end
+			local recv_size = size or 1
+			while #self.readbuf < recv_size do
+				coroutine.yield(self.sock, recvt)
+				if #self.readbuf >= recv_size then
+					break
+				end
+				local data, err, partial = self.sock:receive(32 * 1024)
+				if data then
+					self.readbuf = self.readbuf .. data
+				elseif err == "timeout" then
+					self.readbuf = self.readbuf .. partial
+				else
+					return self:error(err)
+				end
+			end
+			local readbuf = self.readbuf
+			if size then
+				self.readbuf = readbuf:sub(size + 1)
+				return readbuf:sub(1, size)
+			else
+				self.readbuf = ""
+				return readbuf
+			end
+		end,
+		sendto = function (self, data, ip, port)
+			if self.closed then
+				return nil, "closed"
+			end
+			while true do
+				coroutine.yield(self.sock, sendt)
+				local ok, err = self.sock:sendto(data, ip, port)
+				if ok then
+					return true
+				elseif err ~= "timeout" then
+					return self:error(err)
+				end
+			end
+		end,
+		receivefrom = function (self)
+			if self.closed then
+				return nil, "closed"
+			end
+			while true do
+				coroutine.yield(self.sock, recvt)
+				local data, ip, port = self.sock:receivefrom()
+				if data then
+					return data, ip, port
+				elseif ip ~= "timeout" then
+					return self:error(ip)
+				end
+			end
+		end,
+		close = function (self)
+			if self.closed then
+				return false
+			end
+			self.closed = true
+			if self.sock.shutdown then
+				self.sock:shutdown("both")
+			end
+			return self.sock:close()
+		end,
+	},
+	{
+		__index = function (wrapper, name)
+			wrapper[name] = function (self, ...)
+				return self.sock[name](self.sock, ...)
+			end
+			return wrapper[name]
+		end,
+		__call = function (wrapper, sock, closed)
+			sock:settimeout(0)
+			wrapped[sock] =
+			{
+				sock = sock,
+				closed = closed,
+				readbuf = "",
+				writebuf = "",
+			}
+			return setmetatable(wrapped[sock], wrapper.index_mt)
+		end,
+	})
+	wrapper.index_mt = {
+		__index = wrapper,
+		__tostring = function (self)
+			local sock = self.sock
+			local proto = tostring(sock):match("^[^{]+")
+			local _, ip, port = pcall(sock.getsockname, sock)
+			return ("%s:%s:%s"):format(proto or "?", ip or "?", port or "?")
+		end,
+	}
+	if package.config:sub(1, 1) == "\\" then
+		wrapper.connect = wrapper.connect_windows
+	else
+		wrapper.connect = wrapper.connect_unix
+	end
+	local function append(thread, success, sock, set)
+		if not success then
+			xsocket.thread_count = xsocket.thread_count - 1
+			log("error", "thread crashed: %s", debug.traceback(thread, sock))
+			return
+		end
+		if not sock then
+			xsocket.thread_count = xsocket.thread_count - 1
+			return
+		end
+		if set[sock] then
+			table.insert(set[sock].threads, 1, thread)
+		else
+			table.insert(set, sock)
+			set[sock] =
+			{
+				index = #set,
+				threads =
+				{
+					[1] = thread,
+				},
+			}
+		end
+	end
+	local function resume(sock, set)
+		local assoc = set[sock]
+		local thread = table.remove(assoc.threads)
+		if #assoc.threads == 0 then
+			set[sock] = nil
+			local last = table.remove(set)
+			if last ~= sock then
+				set[last].index = assoc.index
+				set[assoc.index] = last
+			end
+		end
+		return append(thread, coroutine.resume(thread))
+	end
+	local function rpairs(t)
+		local function rnext(t, k)
+			k = k - 1
+			if k > 0 then
+				return k, t[k]
+			end
+		end
+		return rnext, t, #t + 1
+	end
+	xsocket =
+	{
+		sendt = sendt,
+		recvt = recvt,
+		slept = slept,
+		thread_count = 0,
+		tcp = function ()
+			local sock, msg = (socket.tcp4 or socket.tcp)()
+			if not sock then
+				return nil, msg
+			end
+			local ok, msg = sock:setoption("reuseaddr", true)
+			if not ok then
+				return nil, msg
+			end
+			return wrapper(sock, true)
+		end,
+		udp = function ()
+			local sock, msg = (socket.udp4 or socket.udp)()
+			if not sock then
+				return nil, msg
+			end
+			local ok, msg = sock:setoption("reuseaddr", true)
+			if not ok then
+				return nil, msg
+			end
+			return wrapper(sock, false)
+		end,
+		gettime = socket.gettime,
+		yield = function ()
+			coroutine.yield(0, slept)
+		end,
+		sleep = function (sec)
+			coroutine.yield(xsocket.gettime() + sec, slept)
+		end,
+		sleep_until = function (ts)
+			if ts > xsocket.gettime() then
+				coroutine.yield(ts, slept)
+			end
+		end,
+		spawn = function (func, ...)
+			local thread = coroutine.create(
+				function (...)
+					func(...)
+					return nil, nil
+				end)
+			xsocket.thread_count = xsocket.thread_count + 1
+			return append(thread, coroutine.resume(thread, ...))
+		end,
+		loop = function ()
+			while true do
+				for _, sock in rpairs(recvt) do
+					if wrapped[sock].closed then
+						resume(sock, recvt)
+					end
+				end
+				for _, sock in rpairs(sendt) do
+					if wrapped[sock].closed then
+						resume(sock, sendt)
+					end
+				end
+				if #slept > 0 then
+					local now = xsocket.gettime()
+					for _, ts in rpairs(slept) do
+						if ts <= now then
+							local assoc = slept[ts]
+							while #assoc.threads > 0 do
+								resume(ts, slept)
+							end
+						end
+					end
+				end
+				local timeout = nil
+				if #slept > 0 then
+					timeout = math.huge
+					for _, ts in ipairs(slept) do
+						timeout = math.min(timeout, ts)
+					end
+					timeout = math.max(0, timeout - xsocket.gettime())
+				end
+				local read, write = socket.select(recvt, sendt, timeout)
+				for _, sock in ipairs(read) do
+					resume(sock, recvt)
+				end
+				for _, sock in ipairs(write) do
+					resume(sock, sendt)
+				end
+			end
+		end,
+	}
+end
+
+-- // xmatchlog // --
+do
+	-- QLadder: append match events as JSON lines for the ladder web app.
+	-- Bytes >= 0x80 are written as \u00XX (latin-1), the reader restores
+	-- the original bytes and decodes them (utf-8 or cp1251).
+	local log = xlog("xmatchlog")
+	local path = xconfig.matchlog
+	local boot = os.time()
+	local escapes =
+	{
+		['"'] = '\\"',
+		["\\"] = "\\\\",
+		["\n"] = "\\n",
+		["\r"] = "\\r",
+		["\t"] = "\\t",
+	}
+	local function encode_string(str)
+		return '"' .. str:gsub('[%z\1-\31"\\\128-\255]',
+			function (c)
+				return escapes[c] or ("\\u%04x"):format(c:byte())
+			end) .. '"'
+	end
+	local encode
+	local function encode_table(tbl)
+		if tbl[1] ~= nil or next(tbl) == nil then
+			local items = {}
+			for _, value in ipairs(tbl) do
+				table.insert(items, encode(value))
+			end
+			return "[" .. table.concat(items, ",") .. "]"
+		end
+		local items = {}
+		for key, value in pairs(tbl) do
+			table.insert(items, encode_string(tostring(key)) .. ":" .. encode(value))
+		end
+		return "{" .. table.concat(items, ",") .. "}"
+	end
+	encode = function (value)
+		local kind = type(value)
+		if kind == "string" then
+			return encode_string(value)
+		elseif kind == "number" then
+			if value ~= value or value == math.huge or value == -math.huge then
+				return "null"
+			end
+			return ("%.14g"):format(value)
+		elseif kind == "boolean" then
+			return tostring(value)
+		elseif kind == "table" then
+			return encode_table(value)
+		end
+		return "null"
+	end
+	local function parser_tree(parser)
+		local children = {}
+		for _, node in parser:pairs() do
+			table.insert(children, parser_tree(node))
+		end
+		return {k = parser.key, v = parser.value, c = children}
+	end
+	local function player_info(client)
+		return
+		{
+			id = client.id,
+			nick = client.nickname or "",
+			cid = client.cid,
+			team = client.team,
+			color = client.color,
+		}
+	end
+	xmatchlog =
+	{
+		enabled = (path ~= nil),
+		boot = boot,
+		encode = function (value)
+			return encode(value)
+		end,
+		emit = function (event)
+			if not path then
+				return
+			end
+			event.boot = boot
+			event.t = xsocket.gettime()
+			local file, err = io.open(path, "ab")
+			if not file then
+				return log("error", "can not open %s: %s", path, tostring(err))
+			end
+			file:write(encode(event), "\n")
+			file:close()
+		end,
+		start = function (session)
+			local players = {}
+			for _, client in pairs(session.clients) do
+				table.insert(players, player_info(client))
+			end
+			return xmatchlog.emit({
+				ev = "start",
+				sid = session.session_id,
+				room = session.real_name,
+				gamename = session.gamename,
+				map = session.mapname,
+				money = session.money,
+				fog = session.fog_of_war,
+				bf = session.battlefield,
+				max_players = session.max_players,
+				master = session.master_id,
+				sync = session.last_datasync,
+				vcore = session.server.vcore,
+				vdata = session.server.vdata,
+				players = players,
+			})
+		end,
+		result = function (session, remote, request)
+			return xmatchlog.emit({
+				ev = "result",
+				sid = session.session_id,
+				from = remote.id,
+				parser_id = request.parser_id,
+				parser = parser_tree(request.parser),
+			})
+		end,
+		leave = function (session, remote, is_master)
+			return xmatchlog.emit({
+				ev = "leave",
+				sid = session.session_id,
+				id = remote.id,
+				nick = remote.nickname or "",
+				master = is_master,
+			})
+		end,
+		account = function (account, id, kind, password_changed)
+			-- no password / cd key here; the email is shown to the owner in the cabinet
+			local info = {}
+			local key = nil
+			for part in ((account.info or "") .. "|"):gmatch("([^|]*)|") do
+				if key == nil then
+					key = part
+				else
+					info[key] = part
+					key = nil
+				end
+			end
+			return xmatchlog.emit({
+				ev = "account",
+				kind = kind,
+				id = id,
+				nick = account.nickname or "",
+				email = account.email or "",
+				country = account.country or "",
+				steam = tonumber(info.sic),
+				banned = account.banned and true or false,
+				pwchanged = password_changed or nil,
+				-- only for a live client (register / login): the site resolves it to a
+				-- country and does not keep the address
+				ip = account.host,
+			})
+		end,
+		close = function (session)
+			return xmatchlog.emit({
+				ev = "close",
+				sid = session.session_id,
+			})
+		end,
+	}
+	local function write_status(status_path)
+		local online = {}
+		local rooms = {}
+		local versions = {}
+		for tag, server in pairs(servers or {}) do
+			local count = 0
+			for _, client in pairs(server.clients) do
+				count = count + 1
+				table.insert(online, {
+					id = client.id,
+					nick = client.nickname or "",
+					room = client.session and client.session.real_name or nil,
+					-- the connection, for the site to look up its round-trip time; never published
+					addr = client.host and client.port and (client.host .. ":" .. client.port) or nil,
+				})
+			end
+			versions[tag] = count
+			for _, session in pairs(server.sessions) do
+				local players = {}
+				for _, client in pairs(session.clients) do
+					table.insert(players, client.nickname or "")
+				end
+				table.insert(rooms, {
+					name = session.real_name,
+					map = session.mapname,
+					max_players = session.max_players,
+					has_password = (session.real_pass ~= ""),
+					playing = session.locked,
+					players = players,
+				})
+			end
+		end
+		local tmp = status_path .. ".tmp"
+		local file = io.open(tmp, "wb")
+		if not file then
+			return
+		end
+		file:write(encode({t = xsocket.gettime(), boot = boot, online = online, rooms = rooms, versions = versions}), "\n")
+		file:close()
+		os.rename(tmp, status_path)
+	end
+	if path then
+		log("info", "writing match events to %s", path)
+		xmatchlog.emit({ev = "boot", version = SICH_VERSION})
+		-- after all modules are loaded: announce every known account
+		xsocket.spawn(
+			function ()
+				for id, account in register:pairs() do
+					xmatchlog.account(account, id, "boot")
+				end
+			end)
+	end
+	if xconfig.status then
+		log("info", "writing lobby status to %s", xconfig.status)
+		xsocket.spawn(
+			function ()
+				while true do
+					local ok, err = pcall(write_status, xconfig.status)
+					if not ok then
+						log("error", "status: %s", tostring(err))
+					end
+					xsocket.sleep(5.0)
+				end
+			end)
+	end
+end
+
+-- // xrecord // --
+do
+	-- QLadder: server-side match recording.
+	-- Every packet a room member sends while in the room (settings, room chat,
+	-- the in-game command stream) is appended to <recordings>/<boot>_<sid>.rec.
+	-- Rooms that never start a match are discarded.
+	--
+	-- File: "QLREC1\n", then records of
+	--   uint32 ms since the room was created (little endian) + raw Sich packet
+	--   (uint32 payload length, uint16 code, uint32 from, uint32 to, payload).
+	-- Markers use code 0xFFFF with a JSON payload (join, leave, lock, master...).
+	local log = xlog("xrecord")
+	local dir = xconfig.recordings
+	local MARKER = 0xFFFF
+	-- private messages between players are not part of a match
+	local SKIP = { [xcmd.SERVER_MESSAGE] = true }
+	local function u32(n)
+		n = math.floor(n)
+		return string.char(n % 256, math.floor(n / 256) % 256, math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+	end
+	local function u16(n)
+		return string.char(n % 256, math.floor(n / 256) % 256)
+	end
+	local function stamp(session)
+		return u32(math.max(0, (xsocket.gettime() - session.rec_t0) * 1000))
+	end
+	xrecord =
+	{
+		open = function (session)
+			if not dir then
+				return
+			end
+			session.rec_name = ("%d_%d.rec"):format(xmatchlog.boot, session.session_id)
+			local file, err = io.open(dir .. "/" .. session.rec_name .. ".part", "wb")
+			if not file then
+				return log("error", "can not open recording: %s", tostring(err))
+			end
+			file:setvbuf("full", 64 * 1024)
+			file:write("QLREC1\n")
+			session.rec_file = file
+			session.rec_t0 = xsocket.gettime()
+		end,
+		packet = function (session, packet)
+			local file = session and session.rec_file
+			if not file or SKIP[packet.code] then
+				return
+			end
+			file:write(stamp(session), packet:get())
+		end,
+		marker = function (session, data)
+			local file = session and session.rec_file
+			if not file then
+				return
+			end
+			local payload = xmatchlog.encode(data)
+			file:write(stamp(session), u32(#payload), u16(MARKER), u32(data.id or 0), u32(0), payload)
+		end,
+		-- packets Sich can not handle, from anyone, in or out of a room:
+		-- <recordings>/unhandled_<boot>.rec, same format as match recordings
+		unhandled = function (remote, packet)
+			if not dir then
+				return
+			end
+			if not xrecord.unhandled_file then
+				local file = io.open(("%s/unhandled_%d.rec"):format(dir, xmatchlog.boot), "ab")
+				if not file then
+					return
+				end
+				file:setvbuf("line")
+				file:write("QLREC1\n")
+				xrecord.unhandled_file = file
+				xrecord.unhandled_t0 = xsocket.gettime()
+			end
+			local ms = (xsocket.gettime() - xrecord.unhandled_t0) * 1000
+			xrecord.unhandled_file:write(u32(ms), packet:get())
+			xrecord.unhandled_file:flush()
+		end,
+		finish = function (session)
+			local file = session.rec_file
+			if not file then
+				return
+			end
+			session.rec_file = nil
+			file:close()
+			local part = dir .. "/" .. session.rec_name .. ".part"
+			if not session.locked then
+				os.remove(part)
+				return
+			end
+			os.rename(part, dir .. "/" .. session.rec_name)
+			log("info", "recorded %s", session.rec_name)
+			xmatchlog.emit({ev = "recording", sid = session.session_id, file = session.rec_name})
+		end,
+	}
+	if dir then
+		log("info", "recording matches to %s", dir)
+	else
+		log("info", "disabled")
+	end
+end
+
+-- // xcommands // --
+do
+	-- Chat commands: a message that starts with "!" in the lobby chat, a private
+	-- message or a room's chat is answered by the server and not passed on.
+	--
+	-- config.store:
+	--   commands = {
+	--     ladder = "/var/lib/ladder/ladder.tsv", -- written by the ladder site (tab-separated, see below)
+	--     site = "https://example.com",          -- links in the answers
+	--     remake_minutes = 5,                    -- !remake works this long after the match starts
+	--     pauses = 3,                            -- !pause: how many a player may take in a match
+	--   },
+	--
+	-- The ladder file: the first line names the columns (id nick rating games wins
+	-- losses position rank rank_ru last_match last_result last_against last_against_ru);
+	-- one player a line.
+	-- The server reads it when a command needs it: it never waits on the network.
+	--
+	-- Answers are in Russian (cp1251) for a game in Russian or Ukrainian, else in
+	-- English; the ladder file is UTF-8 with Russian columns (*_ru).
+	local log = xlog("xcommands")
+	local config = xconfig.commands
+	local site = config and config.site or ""
+	-- A player that is not there: it sits in every client's online list, the
+	-- answers come from it (the game shows them as its messages), and a private
+	-- message to it is a command even without "!". commands.bot = false turns it
+	-- off; commands.bot = { id = ..., nick = "..." } changes it.
+	local bot = nil
+	if config and config.bot ~= false then
+		local b = type(config.bot) == "table" and config.bot or {}
+		bot = {id = b.id or 999999999, nickname = b.nick or "QLadder", states = 0, country = "", info = "",
+			score = 0, games_played = 0, games_win = 0, last_game = 0, pingtime = 0}
+	end
+	local MIN_INTERVAL = 1.0 -- seconds between two commands of a client
+	local REMAKE_MINUTES = config and config.remake_minutes or 5
+	local PAUSES = config and config.pauses or 3
+	-- The pause: a record of the GUI machine (menu.aix), section 66 = ReadPause, its Boolean, 01 end.
+	-- A player's game sends it to the host when the pause key is pressed; the host toggles its pause,
+	-- whatever the Boolean says, and broadcasts the record with its new state (see xapi.lua).
+	local PAUSE_ON, PAUSE_OFF = "\0\4\66\0\1\1", "\0\4\66\0\0\1"
+	local PAUSE_WAIT = 3 -- seconds a pause request waits for the host's answer before another may go
+	-- The save: the GUI machine's section 70, ReadSave: the save's name, the replay's name, the map's
+	-- name (str16: u16 length + bytes), 01 end. The game switched the online saves off, but a machine
+	-- that reads the record still saves the match to its profile under that name (menu.inc/readsave.inc).
+	local SAVE_INTERVAL = 30 -- seconds between two saves of a match
+	local function str16(text)
+		return string.char(#text % 256, math.floor(#text / 256)) .. text
+	end
+	local function save_record(name, map)
+		return "\0\4\70\0" .. str16(name) .. str16("replay.autosave") .. str16(map or "") .. "\1"
+	end
+	-- c3resume: the "load now" record. The c3 mod adds a state ReadLoad to menu.aix right after ReadSave (70),
+	-- so its section number is 71: the save's name (str16), 01 end. config.commands.readload_id changes it.
+	local READLOAD_ID = config and config.readload_id or 71
+	local LOAD_INTERVAL = 10 -- seconds between two loads of a match
+	local function load_record(name)
+		return "\0\4" .. string.char(READLOAD_ID) .. "\0" .. str16(name) .. "\1"
+	end
+	-- c3resume 1.1: the save service (c3saves_server.py) keeps the HOST's copy of every !save in SAVES_DIR;
+	-- this server writes meta.txt there (who and where) and reads index.txt (which files arrived)
+	local SAVES_DIR = (config and config.saves_dir) or "saves" -- relative: the folder start_server.sh runs in
+	local function saves_meta_add(name, room, nicks)
+		if not SAVES_DIR then return end
+		local f = io.open(SAVES_DIR .. "/meta.txt", "a")
+		if f then
+			f:write(("%s\t%d\t%s\t%s\n"):format(name, os.time(), ((room or "?"):gsub("[\t\n]", " ")), (table.concat(nicks, ", "):gsub("[\t\n]", " "))))
+			f:close()
+		end
+	end
+	-- the saves of the matches, newest first: {name =, time =, room =, players =, host_only =}. host_only: the
+	-- server asked the host's game to save it, but no helper uploaded it (the host plays without the save helper):
+	-- the players copy it by hand, the !load check decides. Of the autosaves only the newest one counts.
+	local function saves_has(name)
+		local f = SAVES_DIR and io.open(SAVES_DIR .. "/" .. name .. ".map.gz", "rb")
+		if f then f:close() return true end
+		return false
+	end
+	local function saves_list()
+		local present, out, meta = {}, {}, {}
+		if not SAVES_DIR then return out end
+		local f = io.open(SAVES_DIR .. "/index.txt", "r")
+		if f then
+			for line in f:lines() do
+				local name, size, t = line:match("^([^\t]+)\t(%d+)\t(%d+)")
+				if name then present[name] = tonumber(t) end
+			end
+			f:close()
+		end
+		f = io.open(SAVES_DIR .. "/meta.txt", "r")
+		if f then
+			for line in f:lines() do
+				local name, t, room, players = line:match("^([^\t]+)\t(%d+)\t([^\t]*)\t(.*)$")
+				if name then meta[name] = {time = tonumber(t), room = room, players = players} end
+			end
+			f:close()
+		end
+		for name, t in pairs(present) do
+			local m = meta[name] or {}
+			table.insert(out, {name = name, time = m.time or t, room = m.room or name, players = m.players or ""})
+		end
+		local newest_auto = ""
+		for name in pairs(meta) do
+			if name:find("^qladder_auto_") and name > newest_auto then newest_auto = name end
+		end
+		for name, m in pairs(meta) do
+			if not present[name] and (not name:find("^qladder_auto_") or name == newest_auto) then
+				table.insert(out, {name = name, time = m.time, room = m.room, players = m.players, host_only = true})
+			end
+		end
+		table.sort(out, function (a, b) return a.time > b.time end)
+		return out
+	end
+	local function split_tabs(line)
+		local fields = {}
+		for field in (line .. "\t"):gmatch("([^\t]*)\t") do
+			table.insert(fields, field)
+		end
+		return fields
+	end
+	local function read_ladder()
+		local path = config and config.ladder
+		local file = path and io.open(path, "rb")
+		if not file then
+			return nil
+		end
+		local rows, columns = {}, nil
+		for line in file:lines() do
+			line = line:gsub("\r$", "")
+			if not columns then
+				columns = split_tabs(line)
+			elseif line ~= "" then
+				local row = {}
+				for i, value in ipairs(split_tabs(line)) do
+					row[columns[i] or i] = value
+				end
+				table.insert(rows, row)
+			end
+		end
+		file:close()
+		return rows
+	end
+	local function find_player(rows, nick)
+		nick = nick:lower()
+		for _, row in ipairs(rows) do
+			if (row.nick or ""):lower() == nick then
+				return row
+			end
+		end
+		return nil
+	end
+	local function link(path)
+		return site ~= "" and (site .. path) or ""
+	end
+	local function online_clients()
+		local list = {}
+		for _, server in pairs(servers or {}) do
+			for _, client in pairs(server.clients) do
+				table.insert(list, client)
+			end
+		end
+		table.sort(list, function (a, b) return (a.nickname or "") < (b.nickname or "") end)
+		return list
+	end
+	local function rooms()
+		local list = {}
+		for _, server in pairs(servers or {}) do
+			for _, session in pairs(server.sessions) do
+				table.insert(list, session)
+			end
+		end
+		return list
+	end
+	-- The game's text is cp1251: Russian answers are written here in UTF-8 and
+	-- converted when sent (!test, 2026-09-27: UTF-8 shows as mojibake, cp1251 reads).
+	local CP1251 = {[0x401] = 0xA8, [0x451] = 0xB8, [0x404] = 0xAA, [0x454] = 0xBA, [0x406] = 0xB2, [0x456] = 0xB3,
+		[0x407] = 0xAF, [0x457] = 0xBF, [0x490] = 0xA5, [0x491] = 0xB4, [0xAB] = 0xAB, [0xBB] = 0xBB,
+		[0x2013] = 0x96, [0x2014] = 0x97, [0x2116] = 0xB9}
+	local function cp1251(text)
+		local out, i = {}, 1
+		while i <= #text do
+			local c = text:byte(i)
+			local code, n = c, 1
+			if c >= 0xF0 then
+				code, n = nil, 4
+			elseif c >= 0xE0 then
+				code, n = (c % 16) * 4096 + ((text:byte(i + 1) or 0) % 64) * 64 + (text:byte(i + 2) or 0) % 64, 3
+			elseif c >= 0xC0 then
+				code, n = (c % 32) * 64 + (text:byte(i + 1) or 0) % 64, 2
+			elseif c >= 0x80 then
+				code = nil -- a stray continuation byte
+			end
+			if code and code < 0x80 then
+				table.insert(out, string.char(code))
+			elseif code and code >= 0x410 and code <= 0x44F then
+				table.insert(out, string.char(code - 0x410 + 0xC0))
+			elseif code and CP1251[code] then
+				table.insert(out, string.char(CP1251[code]))
+			else
+				table.insert(out, "?")
+			end
+			i = i + n
+		end
+		return table.concat(out)
+	end
+	local TEXTS = {
+		en = {
+			help = "!rating [nick] - rating, !top - the best, !online - who is on, !rooms - rooms, !last - last match, !odds - chances in a room, !balance - even teams, !remake - replay the match (all agree), !pause / !unpause, !save, !autosave, !saves, !load <number>",
+			site = "Ladder, matches and statistics: %s",
+			unavailable = "The ladder is not available right now.",
+			no_games = "%s: no games on the ladder yet.",
+			rating = "%s: %s, %s%s. Rated games %s (%s-%s). %s",
+			place = ", #%s",
+			top = "%s. %s %s (%s, %s-%s)",
+			nobody = "Nobody is ranked yet: a player is ranked after 5 rated games.",
+			full = "The whole ladder: %s",
+			online = "Online %d: %s%s",
+			no_rooms = "No rooms open.",
+			more = "... and %d more",
+			room = "%s  %d/%d%s%s", playing = ", playing", password = ", password",
+			no_match = "No finished match yet.",
+			last = "%s, match #%s: %s%s. %s", won = "won", lost = "lost", none = "no result", vs = " vs %s",
+			failed = "Sorry, that command failed.",
+			in_room = "This command works in a room.",
+			need_two = "At least two players are needed.",
+			odds = "Chances: %s", odds_side = "%s %d%% (%d)", team = "team %d",
+			no_bots = "(computers are not counted)",
+			balance = "Balanced: %s (%d) vs %s (%d), difference %d.",
+			balance_max = "Balance works for 2 to 8 players.",
+			remake_match = "!remake works in a running match.",
+			remake_player = "Only players vote for a remake.",
+			remake_late = "Too late for a remake: it works in the first %d minutes.",
+			remake_over = "The match has a result already: no remake.",
+			remake_vote = "%s wants a remake (%d/%d). Agree? Type !remake",
+			remake_done = "Remake: everyone agreed. The match does not count for the ladder, you can leave.",
+			pause_match = "!pause works in a running match.",
+			pause_player = "Only players pause the match.",
+			paused_already = "The match is paused already. !unpause resumes it.",
+			not_paused = "The match is not paused.",
+			pause_wait = "A moment: the host has not answered yet.",
+			pause_limit = "No pauses left: %d a match.",
+			pause = "%s asks the host for a pause (%d of %d). !unpause resumes it.",
+			unpause = "%s asks the host to resume.",
+			save_match = "!save works in a running match.",
+			load_match = "!load works in a running match.",
+			load_usage = "Usage: !load <number from !saves>  (or the full name of a save)",
+			load_missing = "The host's save \"%s\" is not on the server (yet). Is the host's c3resume helper running? See !saves.",
+			saves_none = "No saves on the server yet. Make one in a match with !save.",
+			saves_head = "Saves on the server, newest first - continue one with !load <number>:",
+			saves_line = "%d)  %s   %s   %s",
+			saves_more = "... and %d older.",
+			load_wait = "A load was sent a moment ago, wait a few seconds.",
+			load = "%s asks every game to load the save \"%s\".",
+			alone = "Alone in a match the server cannot do this: the game takes it only from another player. Use the pause key.",
+			autopause = "%s lost the connection: the match is paused until they are back (%d s at most).",
+			autoresume = "%s is back: the match goes on.",
+			autotimeout = "%s is not back after %d s: the match goes on.",
+			autogone = "%s left the match: the pause is off.",
+			autogone_key = "%s left the match. Resume with the pause key.",
+			save_wait = "The match was saved a moment ago.",
+			save = "%s saves the match on the host's PC as \"%s\".",
+		},
+		ru = {
+			help = "!rating [ник] — рейтинг, !top — лучшие, !online — кто в лобби, !rooms — комнаты, !last — последний матч, !odds — шансы в комнате, !balance — ровные команды, !remake — переиграть матч (если согласны все), !pause / !unpause, !save, !saves, !load <номер>",
+			site = "Ладдер, матчи и статистика: %s",
+			unavailable = "Ладдер сейчас недоступен.",
+			no_games = "%s: на ладдере пока нет игр.",
+			rating = "%s: %s, %s%s. Рейтинговых игр %s (%s-%s). %s",
+			place = ", место %s",
+			top = "%s. %s %s (%s, %s-%s)",
+			nobody = "В рейтинге пока никого: место дают после 5 рейтинговых игр.",
+			full = "Весь ладдер: %s",
+			online = "В лобби %d: %s%s",
+			no_rooms = "Открытых комнат нет.",
+			more = "... и ещё %d",
+			room = "%s  %d/%d%s%s", playing = ", идёт игра", password = ", с паролем",
+			no_match = "Сыгранных матчей пока нет.",
+			last = "%s, матч №%s: %s%s. %s", won = "победа", lost = "поражение", none = "без результата", vs = " против: %s",
+			failed = "Команда не сработала, извините.",
+			in_room = "Эта команда работает в комнате.",
+			need_two = "Нужно хотя бы двое игроков.",
+			odds = "Шансы: %s", odds_side = "%s %d%% (%d)", team = "команда %d",
+			no_bots = "(компьютеры не учитываются)",
+			balance = "Ровнее всего: %s (%d) против %s (%d), разница %d.",
+			balance_max = "Баланс считается для 2–8 игроков.",
+			remake_match = "!remake работает в идущем матче.",
+			remake_player = "За ремейк голосуют только игроки.",
+			remake_late = "Для ремейка поздно: он возможен в первые %d мин.",
+			remake_over = "У матча уже есть результат: ремейка не будет.",
+			remake_vote = "%s за ремейк (%d/%d). Согласны? Пишите !remake",
+			remake_done = "Ремейк: согласны все. Матч не идёт в ладдер, можно выходить.",
+			pause_match = "!pause работает в идущем матче.",
+			pause_player = "Паузу ставят только игроки.",
+			paused_already = "Матч уже на паузе. Снять: !unpause",
+			not_paused = "Матч не на паузе.",
+			pause_wait = "Секунду: хост ещё не ответил.",
+			pause_limit = "Лимит пауз исчерпан: %d за матч.",
+			pause = "%s просит у хоста паузу (%d из %d). Снять: !unpause",
+			unpause = "%s просит хоста снять паузу.",
+			save_match = "!save работает в идущем матче.",
+			load_match = "!load работает в идущем матче.",
+			load_usage = "Использование: !load <номер из !saves>  (или полное имя сохранения)",
+			load_missing = "Сохранения хоста \"%s\" (ещё) нет на сервере. Работает ли помощник c3resume у хоста? См. !saves.",
+			saves_none = "На сервере ещё нет сохранений. Сохраните матч командой !save.",
+			saves_head = "Сохранения на сервере, новые сверху — продолжить: !load <номер>:",
+			saves_line = "%d)  %s   %s   %s",
+			saves_more = "... и ещё %d старых.",
+			load_wait = "Загрузка только что отправлена, подождите несколько секунд.",
+			load = "%s просит все игры загрузить сохранение \"%s\".",
+			alone = "В матче без других игроков сервер так не может: игра принимает это только от другого игрока. Пауза — клавишей.",
+			autopause = "%s потерял связь: матч на паузе, пока он не вернётся (не дольше %d с).",
+			autoresume = "%s вернулся: продолжаем.",
+			autotimeout = "%s не вернулся за %d с: продолжаем.",
+			autogone = "%s вышел из матча: пауза снята.",
+			autogone_key = "%s вышел из матча. Снять паузу: клавиша Pause.",
+			save_wait = "Матч только что сохранён.",
+			save = "%s сохраняет матч на ПК хоста как «%s».",
+		},
+	}
+	for key, text in pairs(TEXTS.ru) do
+		TEXTS.ru[key] = cp1251(text)
+	end
+	-- a tag before an answer; empty since the answers come from the bot, whose name the game shows
+	local TAG = bot and "" or "%color(E0B050)%[QLadder]%color(default)% "
+	-- A command only collects its answer: reply() adds a line, and the lines are
+	-- sent after the command returns. Sending yields (xsocket), and Lua 5.1 cannot
+	-- yield through the pcall that guards a command.
+	local answer, T, russian
+	-- a ladder value in the player's language: the Russian column converted, else the ASCII one
+	local function field(row, name)
+		if russian and (row[name .. "_ru"] or "") ~= "" then
+			return cp1251(row[name .. "_ru"])
+		end
+		return row[name] or ""
+	end
+	local function reply(remote, text, in_room, code)
+		table.insert(answer, {code or ((in_room and remote.session) and xcmd.USER_SESSION_MSG or xcmd.USER_MESSAGE), text})
+	end
+	-- a message to everyone in the room, each in their own language: TEXTS[key] formatted with args
+	-- (nicks and numbers, the same in every language)
+	local function announce(session, key, ...)
+		table.insert(answer, {xcmd.USER_SESSION_MSG, key = key, args = {...}, session = session})
+	end
+	local commands = {}
+	commands.help = function (remote, arg, in_room)
+		reply(remote, TAG .. T.help, in_room)
+		if site ~= "" then
+			reply(remote, T.site:format(site), in_room)
+		end
+	end
+	commands.rating = function (remote, arg, in_room)
+		local rows = read_ladder()
+		if not rows then
+			return reply(remote, TAG .. T.unavailable, in_room)
+		end
+		local nick = arg ~= "" and arg or (remote.nickname or "")
+		local row = find_player(rows, nick)
+		if not row then
+			return reply(remote, TAG .. T.no_games:format(nick), in_room)
+		end
+		local place = row.position ~= "" and T.place:format(row.position) or ""
+		reply(remote, TAG .. T.rating:format(row.nick, row.rating, field(row, "rank"), place, row.games, row.wins, row.losses,
+			link("/player/" .. row.id)), in_room)
+	end
+	commands.top = function (remote, arg, in_room)
+		local rows = read_ladder()
+		if not rows then
+			return reply(remote, TAG .. T.unavailable, in_room)
+		end
+		local shown = 0
+		for _, row in ipairs(rows) do
+			if row.position ~= "" and shown < 5 then
+				shown = shown + 1
+				reply(remote, (shown == 1 and TAG or "") .. T.top:format(row.position, row.nick, row.rating, field(row, "rank"),
+					row.wins, row.losses), in_room)
+			end
+		end
+		if shown == 0 then
+			reply(remote, TAG .. T.nobody, in_room)
+		end
+		if site ~= "" then
+			reply(remote, T.full:format(link("/ladder")), in_room)
+		end
+	end
+	commands.online = function (remote, arg, in_room)
+		local list = online_clients()
+		local names = {}
+		for i, client in ipairs(list) do
+			if i <= 20 then
+				table.insert(names, client.nickname or "?")
+			end
+		end
+		reply(remote, TAG .. T.online:format(#list, table.concat(names, ", "), #list > 20 and ", ..." or ""), in_room)
+	end
+	commands.rooms = function (remote, arg, in_room)
+		local list = rooms()
+		if #list == 0 then
+			return reply(remote, TAG .. T.no_rooms, in_room)
+		end
+		for i, session in ipairs(list) do
+			if i > 8 then
+				return reply(remote, T.more:format(#list - 8), in_room)
+			end
+			local count = 0
+			for _ in pairs(session.clients) do
+				count = count + 1
+			end
+			-- the room's name is the game's own text (cp1251 already)
+			reply(remote, (i == 1 and TAG or "") .. T.room:format(session.real_name or "?", count, session.max_players or 0,
+				session.locked and T.playing or "", (session.real_pass or "") ~= "" and T.password or ""), in_room)
+		end
+	end
+	commands.last = function (remote, arg, in_room)
+		local rows = read_ladder()
+		local row = rows and find_player(rows, arg ~= "" and arg or (remote.nickname or ""))
+		if not row or (row.last_match or "") == "" then
+			return reply(remote, TAG .. T.no_match, in_room)
+		end
+		local result = row.last_result == "win" and T.won or (row.last_result == "lose" and T.lost or T.none)
+		local against = field(row, "last_against")
+		reply(remote, TAG .. T.last:format(row.nick, row.last_match, result, against ~= "" and T.vs:format(against) or "",
+			link("/match/" .. row.last_match)), in_room)
+	end
+	-- the players of a room with their ladder rating (1500 unknown) and team (0: none); spectators left out
+	local function room_players(session)
+		local rows = read_ladder() or {}
+		local list = {}
+		for _, client in pairs(session.clients) do
+			if client.cid ~= xconst.spectator_countryid then
+				local row = find_player(rows, client.nickname or "")
+				table.insert(list, {nick = client.nickname or "?", rating = row and tonumber(row.rating) or 1500,
+					team = client.room_team or 0})
+			end
+		end
+		table.sort(list, function (a, b) return a.nick < b.nick end)
+		return list
+	end
+	-- computers in the room's datasync: slots of four fields ("-difficulty,cid,team,color")
+	local function room_computers(session)
+		local count = 0
+		for slot in (session.last_datasync or ""):gmatch("[^|]+") do
+			local fields = {}
+			for f in slot:gmatch("[^,]+") do
+				table.insert(fields, f)
+			end
+			if #fields == 4 then
+				count = count + 1
+			end
+		end
+		return count
+	end
+	local function average(players)
+		local sum = 0
+		for _, p in ipairs(players) do
+			sum = sum + p.rating
+		end
+		return #players > 0 and sum / #players or 0
+	end
+	local function nicks(players)
+		local out = {}
+		for _, p in ipairs(players) do
+			table.insert(out, p.nick)
+		end
+		return table.concat(out, ", ")
+	end
+	-- each side's chance: 10^(R/400) over the sum (Elo's expectation for two sides), R the side's average
+	commands.odds = function (remote, arg, in_room)
+		if not remote.session then
+			return reply(remote, TAG .. T.in_room, in_room)
+		end
+		local players = room_players(remote.session)
+		if #players < 2 then
+			return reply(remote, TAG .. T.need_two, in_room)
+		end
+		local sides, by_team = {}, {}
+		for _, p in ipairs(players) do
+			if p.team ~= 0 then
+				if not by_team[p.team] then
+					by_team[p.team] = {team = p.team, players = {}}
+					table.insert(sides, by_team[p.team])
+				end
+				table.insert(by_team[p.team].players, p)
+			else
+				table.insert(sides, {players = {p}})
+			end
+		end
+		table.sort(sides, function (a, b) return (a.team or 99) < (b.team or 99) end)
+		local total, parts = 0, {}
+		for _, side in ipairs(sides) do
+			side.rating = average(side.players)
+			side.weight = 10 ^ (side.rating / 400)
+			total = total + side.weight
+		end
+		for _, side in ipairs(sides) do
+			local name = side.team and (T.team:format(side.team) .. ": " .. nicks(side.players)) or side.players[1].nick
+			table.insert(parts, T.odds_side:format(name, math.floor(100 * side.weight / total + 0.5), math.floor(side.rating + 0.5)))
+		end
+		reply(remote, TAG .. T.odds:format(table.concat(parts, "; ")) ..
+			(room_computers(remote.session) > 0 and (" " .. T.no_bots) or ""), in_room)
+	end
+	-- the split of the room's players into two teams with the closest average ratings
+	commands.balance = function (remote, arg, in_room)
+		if not remote.session then
+			return reply(remote, TAG .. T.in_room, in_room)
+		end
+		local players = room_players(remote.session)
+		if #players < 2 then
+			return reply(remote, TAG .. T.need_two, in_room)
+		end
+		if #players > 8 then
+			return reply(remote, TAG .. T.balance_max, in_room)
+		end
+		local n, half = #players, math.floor(#players / 2)
+		local best, best_mask = nil, nil
+		for mask = 0, 2 ^ n - 1 do
+			local a, b, count = {}, {}, 0
+			for i = 1, n do
+				if math.floor(mask / 2 ^ (i - 1)) % 2 == 1 then
+					table.insert(a, players[i])
+					count = count + 1
+				else
+					table.insert(b, players[i])
+				end
+			end
+			if count == half then -- every split comes twice (a/b and b/a): the same difference
+				local diff = math.abs(average(a) - average(b))
+				if not best or diff < best then
+					best, best_mask = diff, {a, b}
+				end
+			end
+		end
+		local a, b = best_mask[1], best_mask[2]
+		reply(remote, TAG .. T.balance:format(nicks(a), math.floor(average(a) + 0.5), nicks(b), math.floor(average(b) + 0.5),
+			math.floor(best + 0.5)) .. (room_computers(remote.session) > 0 and (" " .. T.no_bots) or ""), in_room)
+	end
+	-- a remake: every player still in the match agrees in its first minutes, and the ladder
+	-- does not count it (the event goes to the match log and the recording)
+	commands.remake = function (remote, arg, in_room)
+		local session = remote.session
+		if not session or not session.locked then
+			return reply(remote, TAG .. T.remake_match, in_room)
+		elseif remote.cid == xconst.spectator_countryid then
+			return reply(remote, TAG .. T.remake_player, in_room)
+		elseif session.remade then
+			return reply(remote, TAG .. T.remake_done, in_room)
+		elseif session.has_result then
+			return reply(remote, TAG .. T.remake_over, in_room)
+		elseif xsocket.gettime() - (session.lock_time or 0) > REMAKE_MINUTES * 60 then
+			return reply(remote, TAG .. T.remake_late:format(REMAKE_MINUTES), in_room)
+		end
+		session.remake_votes = session.remake_votes or {}
+		session.remake_votes[remote.id] = true
+		local agreed, total, ids = 0, 0, {}
+		for id, client in pairs(session.clients) do
+			if client.cid ~= xconst.spectator_countryid then
+				total = total + 1
+				if session.remake_votes[id] then
+					agreed = agreed + 1
+					table.insert(ids, id)
+				end
+			end
+		end
+		if total < 2 then
+			return reply(remote, TAG .. T.need_two, in_room)
+		elseif agreed < total then
+			return announce(session, "remake_vote", remote.nickname or "?", agreed, total)
+		end
+		session.remade = true
+		xmatchlog.emit({ev = "remake", sid = session.session_id, ids = ids})
+		xrecord.marker(session, {ev = "remake", ids = ids})
+		log("info", "remake agreed: %s", session.real_name or "?")
+		announce(session, "remake_done")
+	end
+	-- Who a record to the host comes from. The host takes a GUI record only from another player of its
+	-- room (a live match, 2026-09-26); it drops its own id (match #9), the bot's (match #10) and 0. For
+	-- the host's own command, another player; nil when the host is alone.
+	local function record_sender(session, remote)
+		if remote.id ~= session.master_id then
+			return remote.id
+		end
+		for id in pairs(session.clients) do
+			if id ~= session.master_id then
+				return id
+			end
+		end
+		return nil
+	end
+	-- the pause: the command sends the host the record a player's pause key sends; the state comes
+	-- from the host's broadcasts (xcommands.host_record), so a toggle never goes the wrong way
+	-- ======================================================================= c3resume 2.1
+	-- The games answer questions of the server in hidden chat lines: "#c3check <id> name;name;" asks whether
+	-- they have these saves ("#c3have <id> 0101 <version>"), a finished load is reported as "#c3loaded <name> ok".
+	-- A game without c3resume just shows the question as a chat line and never answers - nothing else happens.
+	local C3T = {
+		en = {
+			checking = "Checking that every player has the save %s ...",
+			fetching = "Still downloading the save: %s ... (a big save can take a few minutes)",
+			not_have = "These PCs could not get the save: %s. Is c3resume installed there and its setup window green?",
+			copy_by_hand = "No save helper running on: %s - the save could not be downloaded there. Copy the file %s.map into the saves folder by hand (see the c3resume README), then !load again.",
+			host_only = "The save %s is only on the host's PC (no save helper uploaded it). These players need a copy of the file %s.map in their saves folder: %s. Then !load again.",
+			saved_local = "Saved on the host's PC as %s. No save helper runs there, so to continue this match another day, the other players need a copy of that file (see the c3resume README).",
+			only_host = "[host PC] ",
+			no_answer = "No answer from: %s. Is c3resume (1.3 or newer) installed there?",
+			not_loading = "So nothing is loaded. The match goes on.",
+			loading = "Everyone has the save. Loading %s on all PCs ...",
+			all_loaded = "Everyone has loaded. The match continues in 5 seconds.",
+			load_failed = "These games could not load the save: %s.",
+			load_slow = "Still loading or no report: %s. Type !unpause when everyone is ready.",
+			load_left = "Left the match during the load: %s. The match stays paused - type !unpause when you want to go on.",
+			load_answer = "Every game reported the load; waiting until each one answers ...",
+			busy = "A save or load is already running, wait a moment.",
+			one_load = "This match was already loaded once. A second load in the same match can freeze the game on the other PCs. To load again: everyone leaves, the host opens a new room, starts the match, then !load.",
+			nomatch = "No save matches \"%s\". Type !saves for the list, then !load <number>.",
+			none = "No saves yet. Make one in a match with !save.",
+			head = "Saved matches, newest first - continue one with !load <number>:",
+			line = "%d)  %s   %s   %s",
+			more = "... and %d older.",
+			saved_up = "Saved. The host's save %s is safe on the server - continue it any day with !saves and !load.",
+			saving = "%s: pausing the match while the host's PC saves it ...",
+			saved_resume = "Saved - the match goes on.",
+			save_slow = "The host's game did not report the save within 90 seconds - the match goes on.",
+			auto_on = "Autosave is ON (%s): the match is saved every %d minutes, only the newest autosave is kept. !autosave turns it off.",
+			auto_off = "Autosave is OFF (%s).",
+			auto_local = "Note: the host plays without the save helper, so every autosave stays on the host's PC as a file of its own. Delete old ones there now and then.",
+			auto_saving = "Autosave: pausing the match for a moment ...",
+			auto_match = "!autosave works in a running match.",
+			saved_not_up = "The host's save did not reach the server. Is the c3resume helper running on %s's PC?",
+		},
+		de = {
+			checking = "Pruefe, ob jeder Spieler den Spielstand %s hat ...",
+			fetching = "Lade den Spielstand noch herunter: %s ... (ein grosser Spielstand kann ein paar Minuten dauern)",
+			not_have = "Diese PCs konnten den Spielstand nicht holen: %s. Ist dort c3resume installiert und das Setup-Fenster gruen?",
+			copy_by_hand = "Kein Speicher-Helfer aktiv bei: %s - dort konnte der Spielstand nicht heruntergeladen werden. Die Datei %s.map von Hand in den Spielstaende-Ordner kopieren (siehe c3resume-Anleitung), dann nochmal !load.",
+			host_only = "Der Spielstand %s ist nur auf dem PC des Hosts (kein Speicher-Helfer hat ihn hochgeladen). Diese Spieler brauchen eine Kopie der Datei %s.map in ihrem Spielstaende-Ordner: %s. Dann nochmal !load.",
+			saved_local = "Auf dem PC des Hosts gespeichert als %s. Dort laeuft kein Speicher-Helfer: um die Partie an einem anderen Tag fortzusetzen, brauchen die anderen Spieler eine Kopie dieser Datei (siehe c3resume-Anleitung).",
+			only_host = "[nur Host-PC] ",
+			no_answer = "Keine Antwort von: %s. Ist dort c3resume (1.3 oder neuer) installiert?",
+			not_loading = "Es wird nichts geladen. Die Partie laeuft weiter.",
+			loading = "Alle haben den Spielstand. Lade %s auf allen PCs ...",
+			all_loaded = "Alle haben geladen. Die Partie geht in 5 Sekunden weiter.",
+			load_failed = "Diese Spiele konnten nicht laden: %s.",
+			load_slow = "Laedt noch oder keine Meldung: %s. Tippt !unpause, wenn alle bereit sind.",
+			load_left = "Waehrend des Ladens ausgestiegen: %s. Die Partie bleibt pausiert - !unpause tippen, wenn es weitergehen soll.",
+			load_answer = "Alle Spiele haben das Laden gemeldet; warte, bis jedes antwortet ...",
+			busy = "Es laeuft schon ein Speicher- oder Ladevorgang, kurz warten.",
+			one_load = "Diese Partie wurde schon einmal geladen. Ein zweites Laden in derselben Partie kann das Spiel auf den anderen PCs einfrieren. Zum erneuten Laden: alle verlassen die Partie, der Host macht einen neuen Raum auf, startet die Partie, dann !load.",
+			nomatch = "Kein Spielstand passt zu \"%s\". !saves zeigt die Liste, dann !load <Nummer>.",
+			none = "Noch keine Spielstaende. Speichert eine Partie mit !save.",
+			head = "Gespeicherte Partien, neueste zuerst - weiterspielen mit !load <Nummer>:",
+			line = "%d)  %s   %s   %s",
+			more = "... und %d aeltere.",
+			saved_up = "Gespeichert. Der Spielstand %s des Hosts liegt sicher auf dem Server - weiterspielen jederzeit mit !saves und !load.",
+			saving = "%s: Pause, waehrend der PC des Hosts die Partie speichert ...",
+			saved_resume = "Gespeichert - die Partie geht weiter.",
+			save_slow = "Das Spiel des Hosts hat das Speichern nicht innerhalb von 90 Sekunden gemeldet - die Partie geht weiter.",
+			auto_on = "Automatisches Speichern ist AN (%s): alle %d Minuten wird gespeichert, nur der neueste Auto-Spielstand bleibt. !autosave schaltet es aus.",
+			auto_off = "Automatisches Speichern ist AUS (%s).",
+			auto_local = "Hinweis: der Host spielt ohne Speicher-Helfer, darum bleibt jeder Auto-Spielstand als eigene Datei auf dem PC des Hosts. Alte dort ab und zu loeschen.",
+			auto_saving = "Automatisches Speichern: kurze Pause ...",
+			auto_match = "!autosave geht nur in einer laufenden Partie.",
+			saved_not_up = "Der Spielstand des Hosts kam nicht auf dem Server an. Laeuft der c3resume-Helfer bei %s?",
+		},
+	}
+	local function c3lang(client)
+		return (client.chat_lang == "de") and "de" or "en"
+	end
+	local function c3prefix(session, client)
+		local their = client.chat_lang or "en"
+		return ((session.chat_prefix or "0|en\7"):gsub("%a%a\7$", their .. "\7"))
+	end
+	local function c3players(session)                     -- the room's game clients (never the bot)
+		local out = {}
+		for id, client in pairs(session.clients) do
+			if not (bot and id == bot.id) then out[id] = client end
+		end
+		return out
+	end
+	-- a line to everybody in the room, each in their language (key of C3T, or a function(lang) -> text)
+	local function c3say(session, key, ...)
+		for _, client in pairs(c3players(session)) do
+			local L = C3T[c3lang(client)]
+			local text = type(key) == "function" and key(L, client) or L[key]:format(...)
+			xpackage(xcmd.USER_SESSION_MSG, bot and bot.id or 0, client.id)
+				:write("s", c3prefix(session, client) .. TAG .. text)
+				:transmit(client)
+		end
+	end
+	-- ask every game which of `names` it has; returns {client id = {bits = "0101", ver = "1.3"}}
+	local function c3ask(session, names, timeout, only)   -- only: ask just this client id (else every game)
+		session.c3seq = (session.c3seq or 0) + 1
+		local ask = {id = tostring(session.c3seq), answers = {}}
+		session.c3asks = session.c3asks or {}
+		session.c3asks[ask.id] = ask
+		local text = "#c3check " .. ask.id .. " " .. table.concat(names, ";") .. ";"
+		for id, client in pairs(c3players(session)) do
+			if not only or id == only then
+				xpackage(xcmd.USER_SESSION_MSG, bot and bot.id or 0, client.id)
+					:write("s", c3prefix(session, client) .. text)
+					:transmit(client)
+			end
+		end
+		local t0 = xsocket.gettime()
+		repeat
+			xsocket.sleep(0.25)
+			local all = true
+			for id in pairs(c3players(session)) do
+				if (not only or id == only) and not ask.answers[id] then all = false break end
+			end
+		until all or xsocket.gettime() - t0 >= timeout
+		session.c3asks[ask.id] = nil
+		return ask.answers
+	end
+	local function c3nicks(session, test)                  -- nicknames of the players for which test(id) is true
+		local out = {}
+		for id, client in pairs(c3players(session)) do
+			if test(id) then table.insert(out, client.nickname or "?") end
+		end
+		table.sort(out)
+		return out
+	end
+	-- saves a running !load needs: the save service flags them, and only then do the players' helpers download them
+	local c3wanted = {}
+	local function c3want(name, seconds)
+		if not SAVES_DIR then return end
+		c3wanted[name] = seconds > 0 and (os.time() + seconds) or nil
+		local f = io.open(SAVES_DIR .. "/wanted.txt.tmp", "w")
+		if not f then return end
+		for n, untill in pairs(c3wanted) do
+			if untill > os.time() then f:write(n, "\t", untill, "\n") else c3wanted[n] = nil end
+		end
+		f:close()
+		os.rename(SAVES_DIR .. "/wanted.txt.tmp", SAVES_DIR .. "/wanted.txt")
+	end
+	-- c3resume 2.2: who runs the save helper. The save service writes the address of every helper that asks it for
+	-- the list (every 5 s) to helpers.txt; a player whose address did not ask lately has no helper (or it cannot
+	-- reach the service) - waiting for its download is pointless, that player copies the save by hand.
+	local function c3_helpers()
+		local f = SAVES_DIR and io.open(SAVES_DIR .. "/helpers.txt", "r")
+		if not f then return nil end                       -- an older save service: assume everyone has one
+		local seen = {}
+		for line in f:lines() do
+			local addr, t = line:match("^(%S+)\t(%d+)")
+			if addr then seen[addr] = tonumber(t) end
+		end
+		f:close()
+		return seen
+	end
+	local function c3_has_helper(client, seen)
+		if not seen or not client or not client.host then return true end
+		local t = seen[client.host]
+		return t ~= nil and os.time() - t < 120
+	end
+	local function c3pause(session, want)                  -- the pause, asked from the server (not counted)
+		local host = session.clients[session.master_id]
+		local from = host and record_sender(session, host)
+		if from then xcommands.send_pause(session, want, from) end
+		return from ~= nil
+	end
+	local function c3_load_flow(session, name)
+		session.c3busy = true
+		c3say(session, "checking", name)
+		local on_server = saves_has(name)
+		if on_server then c3want(name, 150) end
+		local answers, missing, silent, nohelp
+		local function lacking(id) return answers[id] and answers[id].bits:sub(1, 1) ~= "1" end
+		local t0 = xsocket.gettime()
+		local last_told = 0
+		while true do                                      -- a save of a long match is 50-100 MB packed: on a slow line
+			answers = c3ask(session, {name}, 8)              -- (0.3 MB/s) that takes minutes, so wait up to 10 minutes
+			missing = c3nicks(session, lacking)
+			silent = c3nicks(session, function (id) return not answers[id] end)
+			local seen = c3_helpers()                        -- without a helper nothing downloads: do not wait for it
+			nohelp = c3nicks(session, function (id) return lacking(id) and not c3_has_helper(session.clients[id], seen) end)
+			if #missing == 0 or #silent > 0 or not on_server or #nohelp == #missing or xsocket.gettime() - t0 > 600
+				or not session.clients[session.master_id] then break end
+			if xsocket.gettime() - last_told >= 30 then        -- tell who is still downloading, every 30 seconds
+				local busy = c3nicks(session, function (id) return lacking(id) and c3_has_helper(session.clients[id], seen) end)
+				c3say(session, "fetching", table.concat(busy, ", "))
+				last_told = xsocket.gettime()
+			end
+			c3want(name, 150)                                -- keep it wanted while the downloads run
+			xsocket.sleep(3.0)
+		end
+		if on_server then c3want(name, 0) end
+		local players = c3nicks(session, function () return true end)
+		if #missing > 0 or #silent > 0 then
+			if #missing == #players and not on_server then
+				c3say(session, "nomatch", name)                -- nobody has it: a typo, not a transfer problem
+			elseif #missing > 0 and not on_server then         -- the host plays without the helper: copy by hand
+				c3say(session, "host_only", name, name, table.concat(missing, ", "))
+			elseif #missing > 0 then
+				local helped = {}
+				for _, n in ipairs(missing) do helped[n] = true end
+				for _, n in ipairs(nohelp) do helped[n] = nil end
+				local others = {}
+				for n in pairs(helped) do table.insert(others, n) end
+				table.sort(others)
+				if #nohelp > 0 then c3say(session, "copy_by_hand", table.concat(nohelp, ", "), name) end
+				if #others > 0 then c3say(session, "not_have", table.concat(others, ", ")) end
+			end
+			if #silent > 0 then c3say(session, "no_answer", table.concat(silent, ", ")) end
+			c3say(session, "not_loading")
+			session.c3busy = nil
+			return
+		end
+		c3say(session, "loading", name)
+		if not session.paused and c3pause(session, true) then  -- pause only now: a typo or a missing file never pauses
+			local t0 = xsocket.gettime()                       -- and load only once the host really is paused
+			repeat xsocket.sleep(0.25) until session.paused or xsocket.gettime() - t0 > 3
+			xsocket.sleep(1.0)
+		end
+		local host = session.clients[session.master_id]
+		local from = host and record_sender(session, host)
+		local load = {name = name, done = {}}
+		session.c3load = load
+		local record = load_record(name)
+		session.c3loads = (session.c3loads or 0) + 1        -- one load per match (a second one can freeze clients)
+		local starters = {}                                  -- everyone who has to load (also if they drop out)
+		for id, client in pairs(c3players(session)) do
+			starters[id] = client.nickname or "?"
+			xpackage(xcmd.LAN_RECORD, id == session.master_id and from or session.master_id, id)
+				:write_buffer(record):transmit(client)
+		end
+		xrecord.marker(session, {ev = "chat_load", name = name})
+		log("info", "load %s: %s", name, session.real_name or "?")
+		local function names(test)
+			local out = {}
+			for id, nick in pairs(starters) do if test(id) then table.insert(out, nick) end end
+			table.sort(out)
+			return out
+		end
+		local function here(id) return session.clients[id] ~= nil end
+		local t0 = xsocket.gettime()
+		repeat                                               -- big saves: a slow PC may need minutes
+			xsocket.sleep(1.0)
+			local all = true
+			for id in pairs(starters) do
+				if here(id) and not load.done[id] then all = false break end
+			end
+		until all or xsocket.gettime() - t0 >= 600 or not session.clients[session.master_id]
+		session.c3load = nil
+		session.save_time = xsocket.gettime()               -- the next autosave comes a full interval after a load
+		local left = names(function (id) return not here(id) end)
+		local failed = names(function (id) return here(id) and load.done[id] and load.done[id] ~= "ok" end)
+		local waiting = names(function (id) return here(id) and not load.done[id] end)
+		if #failed == 0 and #waiting == 0 and session.clients[session.master_id] then
+			-- every game reported; now each one must also answer, i.e. really run again (not just have reported)
+			local answered = {}
+			local t1, told = xsocket.gettime(), false
+			repeat
+				local answers = c3ask(session, {name}, 8)
+				for id in pairs(answers) do answered[id] = true end
+				waiting = names(function (id) return here(id) and not answered[id] end)
+				if #waiting > 0 and not told and xsocket.gettime() - t1 > 10 then c3say(session, "load_answer") told = true end
+			until #waiting == 0 or xsocket.gettime() - t1 > 180 or not session.clients[session.master_id]
+			left = names(function (id) return not here(id) end)
+		end
+		if #left > 0 then c3say(session, "load_left", table.concat(left, ", ")) end
+		if #failed > 0 then c3say(session, "load_failed", table.concat(failed, ", ")) end
+		if #waiting > 0 then c3say(session, "load_slow", table.concat(waiting, ", ")) end
+		if #left == 0 and #failed == 0 and #waiting == 0 then
+			c3say(session, "all_loaded")
+			xsocket.sleep(5.0)
+			c3pause(session, false)
+		end
+		session.c3busy = nil
+	end
+	local function c3_saves_flow(session)
+		local list = saves_list()
+		if #list == 0 then
+			return c3say(session, "none")
+		end
+		c3say(session, "head")
+		for i = 1, math.min(#list, 9) do
+			local it = list[i]
+			c3say(session, function (L)
+				return L.line:format(i, os.date("%d.%m. %H:%M", it.time), (it.host_only and L.only_host or "")
+					.. (it.name:find("^qladder_auto_") and "[auto] " or "") .. it.room, it.players)
+			end)
+		end
+		if #list > 9 then c3say(session, "more", #list - 9) end
+	end
+	-- !save and the autosave: pause the match, only the host's game saves (its ReadSave writes the file in one go,
+	-- so its answer to a #c3check comes only after the file is complete), unpause, then wait for the helper's upload
+	local function c3_save_flow(session, name, by, auto)
+		local host = session.clients[session.master_id]
+		local from = host and record_sender(session, host)
+		if not from then session.c3busy = nil return end
+		session.save_time = xsocket.gettime()
+		local nicks = {}
+		for _, client in pairs(c3players(session)) do table.insert(nicks, client.nickname or "?") end
+		table.sort(nicks)
+		saves_meta_add(name, session.real_name, nicks)
+		xrecord.marker(session, {ev = auto and "auto_save" or "chat_save", name = name})
+		log("info", "%s %s: %s", auto and "autosave" or "save", name, session.real_name or "?")
+		if auto then c3say(session, "auto_saving") else c3say(session, "saving", by) end
+		local we_paused = false
+		if not session.paused and c3pause(session, true) then
+			we_paused = true
+			local t0 = xsocket.gettime()
+			repeat xsocket.sleep(0.25) until session.paused or xsocket.gettime() - t0 > 3
+			xsocket.sleep(0.5)
+		end
+		xpackage(xcmd.LAN_RECORD, from, session.master_id):write_buffer(save_record(name, session.mapname)):transmit(host)
+		local t0, done = xsocket.gettime(), false
+		repeat
+			xsocket.sleep(1.0)
+			local a = c3ask(session, {name}, 5, session.master_id)[session.master_id]
+			done = a ~= nil and a.bits:sub(1, 1) == "1"
+		until done or xsocket.gettime() - t0 > 90 or not session.clients[session.master_id]
+		if we_paused and session.paused then c3pause(session, false) end
+		session.c3busy = nil
+		if not session.clients[session.master_id] then return end
+		if not auto then c3say(session, done and "saved_resume" or "save_slow") end
+		if not SAVES_DIR then return end
+		if not c3_has_helper(host, c3_helpers()) then        -- the host plays without the save helper: no upload comes
+			if done and not auto then c3say(session, "saved_local", name) end
+			return
+		end
+		t0 = xsocket.gettime()                               -- writing, packing and sending a big save takes minutes
+		while not saves_has(name) and xsocket.gettime() - t0 < 300 do
+			xsocket.sleep(2.0)
+		end
+		if not session.clients[session.master_id] then return end
+		if not saves_has(name) then
+			return c3say(session, "saved_not_up", host.nickname or "?")
+		end
+		if not auto then c3say(session, "saved_up", name) end
+	end
+	local function c3_save_name(session, auto)
+		local now = xsocket.gettime()
+		local minute = math.floor((now - (session.lock_time or now)) / 60)
+		return ("qladder_%s%s_%dmin"):format(auto and "auto_" or "", os.date("%Y%m%d_%H%M%S"), minute)
+	end
+	-- the autosave: one coroutine per switch-on; it ends when switched off, or when the match is over
+	local AUTOSAVE_SECONDS = (config and config.autosave_seconds) or 300
+	local function c3_autosave_loop(session, gen)
+		local function alive()
+			return session.c3auto and session.c3auto.gen == gen and session.locked and session.clients[session.master_id] ~= nil
+		end
+		while alive() do
+			xsocket.sleep(5.0)
+			if alive() and xsocket.gettime() - (session.save_time or session.c3auto.since) >= AUTOSAVE_SECONDS
+				and not session.c3busy then
+				session.c3busy = true
+				c3_save_flow(session, c3_save_name(session, true), nil, true)
+			end
+		end
+	end
+	-- the hidden answers of the games (called by handle() for every room chat line starting with #c3)
+	local function c3_answer(remote, text)
+		local s = remote.session
+		if not s then return end
+		local id, bits, ver = text:match("^#c3have (%S+) (%d*)%s*(%S*)")
+		if id and s.c3asks and s.c3asks[id] then
+			s.c3asks[id].answers[remote.id] = {bits = bits, ver = ver}
+		end
+		local lname, st = text:match("^#c3loaded (%S+) (%S+)")
+		if lname and s.c3load and s.c3load.name == lname then
+			s.c3load.done[remote.id] = st
+		end
+	end
+
+	local function toggle_pause(remote, in_room, want)
+		local session = remote.session
+		if not session or not session.locked then
+			return reply(remote, TAG .. T.pause_match, in_room)
+		elseif remote.cid == xconst.spectator_countryid then
+			return reply(remote, TAG .. T.pause_player, in_room)
+		elseif (session.paused or false) == want then
+			return reply(remote, TAG .. (want and T.paused_already or T.not_paused), in_room)
+		elseif session.pause_sent and xsocket.gettime() - session.pause_sent < PAUSE_WAIT then
+			return reply(remote, TAG .. T.pause_wait, in_room)
+		end
+		local host = session.clients[session.master_id]
+		if not host then
+			return reply(remote, TAG .. T.pause_match, in_room)
+		end
+		session.pauses = session.pauses or {}
+		local used = session.pauses[remote.id] or 0
+		if want and used >= PAUSES then
+			return reply(remote, TAG .. T.pause_limit:format(PAUSES), in_room)
+		end
+		local from = record_sender(session, remote)
+		if not from then
+			return reply(remote, TAG .. T.alone, in_room)
+		end
+		session.pause_sent = xsocket.gettime()
+		xrecord.marker(session, {ev = want and "chat_pause" or "chat_unpause", id = remote.id})
+		table.insert(answer, {send = xpackage(xcmd.LAN_RECORD, from, session.master_id)
+			:write_buffer(want and PAUSE_ON or PAUSE_OFF), to = host})
+		if want then
+			session.pauses[remote.id] = used + 1
+			announce(session, "pause", remote.nickname or "?", used + 1, PAUSES)
+		else
+			announce(session, "unpause", remote.nickname or "?")
+		end
+	end
+	commands.pause = function (remote, arg, in_room)
+		return toggle_pause(remote, in_room, true)
+	end
+	commands.unpause = function (remote, arg, in_room)
+		return toggle_pause(remote, in_room, false)
+	end
+	-- a save of the match on the host's machine only (c3resume 1.4): the host gets the record from a player,
+	-- like one its own WriteSave would read. Its helper uploads the file; the others fetch it when they load.
+	commands.save = function (remote, arg, in_room)
+		local session = remote.session
+		local host = session and session.clients[session.master_id]
+		if not session or not session.locked or not host then
+			return reply(remote, TAG .. T.save_match, in_room)
+		elseif session.save_time and xsocket.gettime() - session.save_time < SAVE_INTERVAL then
+			return reply(remote, TAG .. T.save_wait, in_room)
+		end
+		if not record_sender(session, host) then
+			return reply(remote, TAG .. T.alone, in_room)
+		elseif session.c3busy then
+			return reply(remote, TAG .. C3T[c3lang(remote)].busy, in_room)
+		end
+		session.c3busy = true
+		session.save_time = xsocket.gettime()
+		xsocket.spawn(c3_save_flow, session, c3_save_name(session, false), remote.nickname or "?", false)
+	end
+	-- !autosave [on|off]: save the match every 5 minutes; the save service keeps only the newest autosave
+	commands.autosave = function (remote, arg, in_room)
+		local session = remote.session
+		local host = session and session.clients[session.master_id]
+		local L = C3T[c3lang(remote)]
+		if not session or not session.locked or not host then
+			return reply(remote, TAG .. L.auto_match, in_room)
+		end
+		local want = (arg or ""):lower():match("^%s*(%a*)")
+		local on
+		if want == "on" or want == "an" then on = true
+		elseif want == "off" or want == "aus" then on = false
+		else on = not session.c3auto end
+		local nick = remote.nickname or "?"
+		if on then
+			if not session.c3auto then
+				session.c3autogen = (session.c3autogen or 0) + 1
+				session.c3auto = {gen = session.c3autogen, since = xsocket.gettime()}
+				xsocket.spawn(c3_autosave_loop, session, session.c3autogen)
+			end
+			xsocket.spawn(function ()
+				c3say(session, "auto_on", nick, math.floor(AUTOSAVE_SECONDS / 60 + 0.5))
+				if not c3_has_helper(host, c3_helpers()) then c3say(session, "auto_local") end
+			end)
+		else
+			session.c3auto = nil
+			xsocket.spawn(c3say, session, "auto_off", nick)
+		end
+	end
+	-- c3resume: every machine loads the named save from its own saved games (state ReadLoad of the mod).
+	-- c3_load_flow lets the helpers fetch the host's file first, checks every game has it, pauses, loads, unpauses.
+	commands.load = function (remote, arg, in_room)
+		local session = remote.session
+		local host = session and session.clients[session.master_id]
+		if not session or not session.locked or not host then
+			return reply(remote, TAG .. T.load_match, in_room)
+		end
+		local want = (arg or ""):match("^%s*(.-)%s*$")
+		if want == "" then
+			return reply(remote, TAG .. T.load_usage, in_room)
+		end
+		if session.c3busy then
+			return reply(remote, TAG .. C3T[c3lang(remote)].busy, in_room)
+		end
+		if (session.c3loads or 0) > 0 then
+			return reply(remote, TAG .. C3T[c3lang(remote)].one_load, in_room)
+		end
+		local list = saves_list()
+		local name
+		local number = tonumber(want:match("^#?(%d+)$") or "")
+		if number and list[number] then
+			name = list[number].name
+		else
+			for _, it in ipairs(list) do                       -- the exact name, else the only one containing it
+				if it.name == want then name = it.name break end
+			end
+			if not name then
+				local hits = {}
+				for _, it in ipairs(list) do
+					if it.name:lower():find(want:lower(), 1, true) then table.insert(hits, it.name) end
+				end
+				if #hits == 1 then name = hits[1] end
+			end
+			if not name and not number and not want:find("[^%w_%-%.]") and #want <= 100 then
+				name = want                                      -- a save that is not on the server: the check decides
+			end
+		end
+		if not name then
+			return reply(remote, TAG .. C3T[c3lang(remote)].nomatch:format(want), in_room)
+		end
+		if not record_sender(session, host) then
+			return reply(remote, TAG .. T.alone, in_room)
+		end
+		session.load_time = xsocket.gettime()
+		xsocket.spawn(c3_load_flow, session, name)
+	end
+
+	-- c3resume 1.1: the numbered list of saves for !load <number>
+	commands.saves = function (remote, arg, in_room)
+		if not remote.session then
+			local list = saves_list()
+			if #list == 0 then return reply(remote, TAG .. T.saves_none, in_room) end
+			reply(remote, TAG .. T.saves_head, in_room)
+			for k = 1, math.min(#list, 9) do
+				local it = list[k]
+				reply(remote, T.saves_line:format(k, os.date("%d.%m. %H:%M", it.time), (it.host_only and "[host PC] " or "")
+					.. (it.name:find("^qladder_auto_") and "[auto] " or "") .. it.room, it.players), in_room)
+			end
+			return
+		end
+		xsocket.spawn(c3_saves_flow, remote.session)
+	end
+	-- how the game shows server messages: both kinds of message, ASCII and Cyrillic in both encodings
+	commands.test = function (remote, arg, in_room)
+		local utf8 = "\208\159\209\128\208\190\208\178\208\181\209\128\208\186\208\176" -- "Проверка" in UTF-8
+		local win = "\207\240\238\226\229\240\234\224"                             -- "Проверка" in cp1251
+		for _, code in ipairs({xcmd.USER_MESSAGE, remote.session and xcmd.USER_SESSION_MSG or nil}) do
+			local kind = code == xcmd.USER_MESSAGE and "private" or "room"
+			for _, line in ipairs({
+				"[" .. kind .. " 1] ASCII: test",
+				"[" .. kind .. " 2] UTF-8: " .. utf8,
+				"[" .. kind .. " 3] cp1251: " .. win,
+				"[" .. kind .. " 4] %color(00DD00)%colour%color(default)%",
+			}) do
+				reply(remote, line, in_room, code)
+			end
+		end
+	end
+	xcommands =
+	{
+		enabled = (config ~= nil),
+		-- true when the message was a command (answered here, not passed on)
+		bot = bot,
+		-- a game packet (LAN_RECORD) from a room's host: follow its pause broadcasts
+		host_record = function (session, payload)
+			local on, off = payload:find(PAUSE_ON, 1, true), payload:find(PAUSE_OFF, 1, true)
+			if not on and not off then
+				return
+			end
+			-- the last one in the packet wins
+			local last_on, last_off = on, off
+			while on do
+				last_on, on = on, payload:find(PAUSE_ON, on + 1, true)
+			end
+			while off do
+				last_off, off = off, payload:find(PAUSE_OFF, off + 1, true)
+			end
+			session.paused = (last_on or 0) > (last_off or 0)
+			session.pause_sent = nil
+		end,
+		-- For xautopause (a coroutine of its own: these send, and sending yields).
+		-- A message to everyone in a room, each in their language: TEXTS[key] formatted with args.
+		say = function (session, key, ...)
+			local args = {...}
+			for _, client in pairs(session.clients) do
+				local their = client.chat_lang or "ru" -- the game transliterates ru for other languages
+				local texts = (their == "ru" or their == "uk") and TEXTS.ru or TEXTS.en
+				local prefix = (session.chat_prefix or (session.locked and "0|ru\7" or "ru\7")):gsub("%a%a\7$", their .. "\7")
+				xpackage(xcmd.USER_SESSION_MSG, bot and bot.id or 0, client.id)
+					:write("s", prefix .. TAG .. texts[key]:format(unpack(args)))
+					:transmit(client)
+			end
+		end,
+		-- the pause record to a room's host, as the player `from` (see record_sender); false when it cannot go
+		send_pause = function (session, want, from)
+			local host = session.clients[session.master_id]
+			if not host or not from or from == session.master_id then
+				return false
+			end
+			session.pause_sent = xsocket.gettime()
+			xpackage(xcmd.LAN_RECORD, from, session.master_id)
+				:write_buffer(want and PAUSE_ON or PAUSE_OFF)
+				:transmit(host)
+			return true
+		end,
+		record_sender = function (session, remote)
+			return record_sender(session, remote)
+		end,
+		-- a private message to the bot: whatever it says goes to handle()
+		for_bot = function (id)
+			return bot ~= nil and id == bot.id
+		end,
+		handle = function (remote, message, in_room, to_bot)
+			if not config or type(message) ~= "string" then
+				return false
+			end
+			-- the game sends "<lang>\7<text>" ("ru\7!top"), in a match's console "<mode>|<lang>\7<text>";
+			-- it shows an incoming message by the same format (transliterating ru/uk for other languages)
+			local prefix, text = message:match("^(.-\7)(.*)$")
+			if not prefix then
+				prefix, text = "", message
+			end
+			-- the player's game language: Russian answers for ru and uk, English for the rest
+			local lang = prefix:match("(%a%a)\7$") or "en"
+			remote.chat_lang = lang -- for messages to the whole room
+			if in_room and remote.session and prefix ~= "" then
+				remote.session.chat_prefix = prefix -- in a match "0|<lang>\7": xcommands.say talks the same way
+			end
+			if in_room and remote.session and text:sub(1, 3) == "#c3" then
+				c3_answer(remote, text)              -- c3resume: a game's hidden answer, not shown to anyone
+				return true
+			end
+			if text:sub(1, 1) ~= "!" and not to_bot then
+				return false
+			end
+			local name, arg = text:match("^!(%a+)%s*(.-)%s*$")
+			if to_bot and not name then
+				name, arg = text:match("^!?(%a+)%s*(.-)%s*$") -- to the bot, "top" is "!top"
+			end
+			local command = name and commands[name:lower()]
+			if not command then
+				if to_bot then
+					name, command, arg = "help", commands.help, "" -- the bot answers anything it does not know with the list
+				else
+					return false -- "!!!" and the like are just chat
+				end
+			end
+			russian = (lang == "ru" or lang == "uk")
+			T = russian and TEXTS.ru or TEXTS.en
+			local now = xsocket.gettime()
+			if remote.command_time and now - remote.command_time < MIN_INTERVAL then
+				return true
+			end
+			remote.command_time = now
+			remote.log("info", "command: %s %s", name:lower(), arg)
+			answer = {}
+			local ok, err = pcall(command, remote, arg, in_room)
+			local lines = answer
+			answer = nil
+			if not ok then
+				log("error", "command %s: %s", name, tostring(err))
+				lines = {{xcmd.USER_MESSAGE, TAG .. T.failed}}
+			end
+			for _, line in ipairs(lines) do
+				if line.send then
+					line.send:transmit(line.to)
+				elseif line.session then
+					for _, client in pairs(line.session.clients) do
+						local their = client.chat_lang or lang
+						local texts = (their == "ru" or their == "uk") and TEXTS.ru or TEXTS.en
+						xpackage(line[1], bot and bot.id or 0, client.id)
+							:write("s", prefix:gsub("%a%a\7$", their .. "\7") .. TAG .. texts[line.key]:format(unpack(line.args)))
+							:transmit(client)
+					end
+				else
+					xpackage(line[1], bot and bot.id or 0, remote.id)
+						:write("s", prefix .. line[2])
+						:transmit(remote)
+				end
+			end
+			return true
+		end,
+	}
+	if config then
+		log("info", "chat commands on, ladder %s", tostring(config.ladder))
+	else
+		log("info", "disabled")
+	end
+end
+
+-- // xsession // --
+do
+	local log = xlog("xsession")
+	local next_session_id = 1
+	xsession = xclass
+	{
+		__parent = xclients,
+		__create = function (self, remote, request)
+			if remote.session then
+				remote.session:leave(remote)
+			elseif remote.server.sessions[remote.id] then
+				return
+			end
+			self = xclients.__create(self)
+			self.real_name = ""
+			self.real_pass = ""
+			self.locked = false
+			self.closed = false
+			self.server = remote.server
+			self.session_id = next_session_id
+			next_session_id = next_session_id + 1
+			self.master_id = remote.id
+			self.max_players = request.max_players
+			self.password = request.password
+			self.gamename = request.gamename
+			self:split_gamename()
+			self.mapname = request.mapname
+			self.money = request.money
+			self.fog_of_war = request.fog_of_war
+			self.battlefield = request.battlefield
+			self.clients[remote.id] = remote
+			self.score_updated = remote.score_updated or {}
+			remote.score_updated = nil
+			remote.log("info", "creating new room: name=%q, pass=%q", self.real_name, self.real_pass)
+			remote.session = self
+			remote:set_state("session", true)
+			remote:set_state("master", true)
+			self.server.sessions[self.master_id] = self
+			xrecord.open(self)
+			xrecord.marker(self, {ev = "create", id = remote.id, nick = remote.nickname or "",
+				room = self.real_name, map = self.mapname, max_players = self.max_players})
+			xpackage(xcmd.USER_SESSION_CREATE, remote.id, 0)
+				:write_byte(remote.states)
+				:write_object(self, "4ss4b1",
+					"max_players",
+					"gamename",
+					"mapname",
+					"money",
+					"fog_of_war",
+					"battlefield")
+				:broadcast(remote)
+			return self
+		end,
+		split_gamename = function (self)
+			local parts = {}
+			for part in self.gamename:gmatch("[^\t]+") do
+				part = part:match('^"(.*)"$') or part
+				table.insert(parts, part)
+			end
+			if #parts >= 2 then
+				self.real_name, self.real_pass = unpack(parts)
+			end
+		end,
+		message = function (self, remote, request)
+			if xcommands.handle(remote, request.message, true) then
+				return -- a chat command: answered, not passed on
+			end
+			return xpackage(xcmd.USER_SESSION_MSG, request.id_from, request.id_to)
+				:write("s", request.message)
+				:session_dispatch(remote)
+		end,
+		join = function (self, remote)
+			if remote.session then
+				remote.session:leave(remote)
+			end
+			remote.log("info", "joining room: %s", self.real_name)
+			if self.locked then
+				return remote.log("warn", "session locked")
+			end
+			if self:get_clients_count() == self.max_players then
+				return remote.log("warn", "can not join, session is full")
+			end
+			self.clients[remote.id] = remote
+			remote.session = self
+			remote:set_state("session", true)
+			xrecord.marker(self, {ev = "join", id = remote.id, nick = remote.nickname or ""})
+			return xpackage(xcmd.USER_SESSION_JOIN, remote.id, 0)
+				:write("41",
+					self.master_id,
+					remote.states)
+				:broadcast(remote)
+		end,
+		leave = function (self, remote)
+			local new_master = nil
+			local new_clients = {}
+			local is_master = (self.master_id == remote.id)
+			if not is_master then
+				remote:set_state("played", false)
+				remote:set_state("session", false)
+			else
+				for _, client in pairs(self.clients) do
+					client:set_state("played", false)
+					client:set_state("session", false)
+				end
+				remote:set_state("master", false)
+				if self.locked then
+					if not self.closed then
+						self:close(remote)
+					end
+					for _, client in pairs(self.clients) do
+						if client == remote then
+							--
+						elseif not new_master then
+							new_master = client
+						else
+							table.insert(new_clients, client)
+						end
+					end
+				end
+			end
+			if self.locked and not self.closed then
+				xmatchlog.leave(self, remote, is_master)
+			end
+			xrecord.marker(self, {ev = "leave", id = remote.id, nick = remote.nickname or "", master = is_master})
+			remote.log("info", "leaving room: %s", self.real_name)
+			xpackage(xcmd.USER_SESSION_LEAVE, remote.id, 0)
+				:write_boolean(is_master)
+				:write_objects(is_master and self.clients or {remote}, "41",
+					"id",
+					"states")
+				:broadcast(remote)
+			remote.session = nil
+			self.clients[remote.id] = nil
+			if self:get_clients_count() == 0 then
+				remote.log("info", "destroying room: %s", self.real_name)
+				self.server.sessions[self.master_id] = nil
+				xrecord.finish(self)
+			end
+			if new_master then
+				remote.log("info", "new session master: %s", new_master.nickname)
+				xrecord.marker(self, {ev = "master", id = new_master.id, nick = new_master.nickname or ""})
+				new_master.score_updated = self.score_updated
+				xsocket.spawn(
+					function ()
+						xsocket.sleep(90.0)
+						new_master.score_updated = nil
+					end)
+				local parser = xparser("", "\0")
+				parser:add("gamename", self.gamename)
+				parser:add("mapname", self.mapname)
+				parser:add("master", new_master.id)
+				parser:add("session", self.session_id)
+				parser:add("clients", 1 + #new_clients)
+				local clientlist = parser:add("clientlist", "\0")
+				clientlist:add("*", new_master.id)
+				for _, client in ipairs(new_clients) do
+					clientlist:add("*", client.id)
+				end
+				xpackage(xcmd.USER_SESSION_RECREATE, new_master.id, new_master.id)
+					:write_parser_with_size(parser)
+					:transmit(new_master)
+				local rejoin = xpackage(xcmd.USER_SESSION_REJOIN, new_master.id, 0)
+				for _, client in ipairs(new_clients) do
+					rejoin:transmit(client)
+				end
+			end
+		end,
+		lock = function (self, remote, request)
+			remote.log("info", "locking room: %s", self.real_name)
+			self.locked = true
+			self.lock_time = xsocket.gettime() -- !remake works in the first minutes
+			for _, info in ipairs(request.clients) do
+				local client = self.clients[info.id]
+				if client then
+					-- the lock carries the lobby team (LanClSetMyTeam): a placeholder in regular rooms
+					-- (the creator gets 13); the room datasync has the team picked in the game
+					client.team = client.room_team or info.team
+				end
+			end
+			for _, client in pairs(self.clients) do
+				if client.cid == xconst.spectator_countryid then
+					self.score_updated[client.id] = true
+				end
+				client:set_state("played", true)
+			end
+			xmatchlog.start(self)
+			local players = {}
+			for _, client in pairs(self.clients) do
+				table.insert(players, {id = client.id, nick = client.nickname or "", cid = client.cid,
+					team = client.team, color = client.color})
+			end
+			xrecord.marker(self, {ev = "lock", id = remote.id, map = self.mapname, players = players})
+			local count = 0
+			for _ in pairs(self.clients) do
+				count = count + 1
+			end
+			if self.server.vdata >= 0x00020203 then
+				count = count + 1
+			end
+			local response = xpackage(xcmd.USER_SESSION_LOCK, remote.id, 0)
+				:write_dword(count)
+			for _, client in pairs(self.clients) do
+				response
+					:write_object(client, "41",
+						"id",
+						"states")
+			end
+			if self.server.vdata >= 0x00020203 then
+				response
+					:write("44",
+						0,
+						self.session_id)
+			end
+			return response
+				:broadcast(remote)
+		end,
+		info = function (self, remote)
+			return xpackage(xcmd.USER_SESSION_INFO, self.master_id, 0)
+				:write_object(self, "4ss4b1",
+					"max_players",
+					"gamename",
+					"mapname",
+					"money",
+					"fog_of_war",
+					"battlefield")
+				:write_objects(self.clients, "41",
+					"id",
+					"states")
+				:broadcast(remote)
+		end,
+		update = function (self, remote, request)
+			remote.log("debug", "updating room: %s", self.real_name)
+			self.gamename = request.gamename
+			self:split_gamename()
+			self.mapname = request.mapname
+			self.money = request.money
+			self.fog_of_war = request.fog_of_war
+			self.battlefield = request.battlefield
+			return self:info(remote)
+		end,
+		client_update = function (self, remote, request)
+			remote.log("debug", "updating client team: %d", request.team)
+			remote.team = request.team
+			return xpackage(xcmd.USER_SESSION_CLIENT_UPDATE, remote.id, 0)
+				:write_byte(remote.team)
+				:broadcast(remote)
+		end,
+		close = function (self, remote)
+			remote.log("info", "closing room: %s", self.real_name)
+			self.closed = true
+			xmatchlog.close(self)
+			xrecord.marker(self, {ev = "close", id = remote.id})
+			return xpackage(xcmd.USER_SESSION_CLOSE, remote.id, 0)
+				:write("t", xsocket.gettime())
+				:write_objects(self.clients, "44",
+					"id",
+					"score")
+				:session_broadcast(remote)
+		end,
+		kick = function (self, remote, request)
+			if not self:check_client(request.id) then
+				return
+			end
+			local client = self.clients[request.id]
+			remote.log("info", "kicking user: %s", client.nickname)
+			self:leave(client)
+			return xpackage(xcmd.USER_SESSION_KICK, remote.id, 0)
+				:write_dword(client.id)
+				:transmit(remote)
+		end,
+		clscore = function (self, remote, request)
+			if not self:check_client(request.id) then
+				return
+			end
+			local client = self.clients[request.id]
+			client.score = request.score
+			xmatchlog.emit({ev = "score", sid = self.session_id, id = request.id, score = request.score})
+			return xpackage(xcmd.USER_SESSION_CLSCORE, remote.id, 0)
+				:write_object(client, "44",
+					"id",
+					"score")
+				:broadcast(remote)
+		end,
+		datasync = function (self, remote, request)
+			local parser_s = request.parser:get("s")
+			if not parser_s then
+				return
+			end
+			self.last_datasync = parser_s
+			for str in parser_s:gmatch("[^|]+") do
+				local parts = {}
+				for sub in str:gmatch("[^,]+") do
+					table.insert(parts, tonumber(sub))
+				end
+				if #parts == 5 then
+					local id, cid, team, color, ready = unpack(parts)
+					local client = self.clients[id]
+					if client then
+						client.cid = cid
+						client.color = color
+						client.room_team = team
+					end
+				end
+			end
+		end,
+		results = function (self, remote, request)
+			local save_register = false
+			for _, node in request.parser:pairs() do
+				local id = tonumber(node:get("id"))
+				local res = tonumber(node:get("res"))
+				if not id or not res then
+					--
+				elseif id == 0 or res == xconst.player_victorystate.none then
+					--
+				elseif self.score_updated[id] then
+					--
+				else
+					local client = self.clients[id] or self.server.clients[id]
+					if not client then
+						client = {}
+						if not register:get(client, id) then
+							client = nil
+						end
+					end
+					if not client then
+						log("warn", "unknown client id: %d", id)
+					else
+						client.last_game = xsocket.gettime()
+						client.games_played = client.games_played + 1
+						if res == xconst.player_victorystate.win then
+							client.games_win = client.games_win + 1
+						end
+						--[[
+							win,%   score   rank
+							 0          0   -2 Esquire
+							40        800   -1 Esquire
+							45        900    0 Esquire
+							50.05    1001    1 Esquire
+							55       1100    2 Nobleman
+							57.5     1150    3 Knight
+							61.5     1230    4 Baron
+							65       1300    5 Viscount
+							69       1380    6 Earl
+							71.25    1425    7 Marquis
+							73.75    1475    8 Duke
+							80       1600    9 King
+							95       1900   10 Emperor
+						]]
+						client.score = math.ceil(client.games_win / client.games_played * 2000.0)
+						log("info", "updating score for %s: state=%s, played=%s, win=%s, score=%s", client.nickname,
+							xconst.player_victorystate[res], client.games_played, client.games_win, client.score)
+						register:update(client, true)
+						save_register = true
+						self.score_updated[id] = true
+					end
+				end
+			end
+			if save_register then
+				register:save()
+			end
+		end,
+	}
+end
+
+-- // xserver // --
+do
+	local log = xlog("xserver")
+	-- accounts.managed: accounts and passwords come from the local API (a website) only;
+	-- the game can neither register nor change a password
+	local function managed_accounts()
+		return xconfig.accounts and xconfig.accounts.managed
+	end
+	local custom_core = xclass
+	{
+		__parent = xclients,
+		vcore = 0x00000000,
+		vdata = 0x00000000,
+		connected = function (self, remote)
+			remote.server = self
+		end,
+		disconnected = function (self, remote)
+			remote.server = nil
+		end,
+		process = function (self, remote, packet)
+			local request = packet:parse(self.vcore, self.vdata)
+			if not request then
+				-- unknown format: keep it for protocol research (end-of-game stats?)
+				return xrecord.unhandled(remote, packet)
+			end
+			local code = request.code
+			if not self[code] then
+				xrecord.unhandled(remote, packet)
+				return log("warn", "request is not allowed or not implemented: %s", xcmd.format(code))
+			end
+			return self[code](self, remote, request)
+		end,
+	}
+	local server_core = xclass
+	{
+		__parent = custom_core,
+		__create = function (self, vcore, vdata)
+			self = custom_core.__create(self)
+			self.vcore = vcore
+			self.vdata = vdata
+			self.sessions = {}
+			return self
+		end,
+		connected = function (self, remote)
+			self.clients[remote.id] = remote
+			remote.log = xlog("xclient", remote.nickname)
+			remote:set_state("online", true)
+			return custom_core.connected(self, remote)
+		end,
+		disconnected = function (self, remote)
+			if remote.session then
+				remote.session:leave(remote)
+			end
+			remote:set_state("online", false)
+			self.clients[remote.id] = nil
+			self:broadcast(
+				xpackage(xcmd.USER_DISCONNECTED, remote.id, 0))
+			return custom_core.disconnected(self, remote)
+		end,
+		check_session = function (self, remote)
+			if not remote.session then
+				remote.log("warn", "remote has no session")
+				return false
+			end
+			return true
+		end,
+		check_session_master = function (self, remote)
+			if not self:check_session(remote) then
+				return false
+			end
+			if remote.session.master_id ~= remote.id then
+				remote.log("debug", "remote is not session master")
+				return false
+			end
+			return true
+		end,
+		session_action = function (self, action, remote, request)
+			if not self:check_session(remote) then
+				return
+			end
+			return remote.session[action](remote.session, remote, request)
+		end,
+		master_session_action = function (self, action, remote, request)
+			if not self:check_session_master(remote) then
+				return
+			end
+			return remote.session[action](remote.session, remote, request)
+		end,
+		get_server_clients = function (self, response)
+			local clients = {}
+			for _, client in pairs(self.clients) do
+				table.insert(clients, client)
+			end
+			if xcommands.bot then
+				table.insert(clients, xcommands.bot) -- the chat commands' bot: listed, never sent to
+			end
+			for _, client in ipairs(clients) do
+				response
+					:write_object(client, "41sss",
+						"id",
+						"states",
+						"nickname",
+						"country",
+						"info")
+				if self.vdata >= 0x00020100 then
+					response
+						:write_object(client, "444td",
+							"score",
+							"games_played",
+							"games_win",
+							"last_game",
+							"pingtime")
+				end
+			end
+			response
+				:write_dword(0)
+		end,
+		get_server_sessions = function (self, response)
+			for _, session in pairs(self.sessions) do
+				if not session.locked then
+					response
+						:write_object(session, "44ss4b1",
+							"master_id",
+							"max_players",
+							"gamename",
+							"mapname",
+							"money",
+							"fog_of_war",
+							"battlefield")
+						:write_objects(session.clients, "4",
+							"id")
+				end
+			end
+			response
+				:write_dword(0)
+		end,
+		[xcmd.SERVER_CLIENTINFO] = function (self, remote, request)
+			local client = xcommands.for_bot(request.id) and xcommands.bot or self.clients[request.id]
+			if not client and not self:check_client(request.id) then
+				return
+			end
+			local response = xpackage(xcmd.USER_CLIENTINFO, client.id, remote.id)
+				:write_object(client, "41ss444ts",
+					"id",
+					"states",
+					"nickname",
+					"country",
+					"score",
+					"games_played",
+					"games_win",
+					"last_game",
+					"info")
+			if self.vdata >= 0x00020100 then
+				response
+					:write_object(client, "d",
+						"pingtime")
+			end
+			return response
+				:transmit(remote)
+		end,
+		[xcmd.SERVER_SESSION_MSG] = function (self, remote, request)
+			return self:session_action("message", remote, request)
+		end,
+		[xcmd.SERVER_MESSAGE] = function (self, remote, request)
+			if xcommands.handle(remote, request.message, false, xcommands.for_bot(request.id_to)) then
+				return -- a chat command: answered, not passed on
+			end
+			xpackage(xcmd.USER_MESSAGE, request.id_from, request.id_to)
+				:write("s", request.message)
+				:dispatch(remote)
+		end,
+		[xcmd.SERVER_SESSION_CREATE] = function (self, remote, request)
+			xsession(remote, request)
+		end,
+		[xcmd.SERVER_SESSION_JOIN] = function (self, remote, request)
+			if not self.sessions[request.master_id] then
+				return remote.log("debug", "no such session: %d", request.master_id)
+			end
+			return self.sessions[request.master_id]:join(remote, request)
+		end,
+		[xcmd.SERVER_SESSION_LEAVE] = function (self, remote, request)
+			return self:session_action("leave", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_LOCK] = function (self, remote, request)
+			return self:master_session_action("lock", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_INFO] = function (self, remote, request)
+			return self:session_action("info", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_UPDATE] = function (self, remote, request)
+			return self:master_session_action("update", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_CLIENT_UPDATE] = function (self, remote, request)
+			return self:session_action("client_update", remote, request)
+		end,
+		[xcmd.SERVER_VERSION_INFO] = function (self, remote, request)
+			return xpackage(xcmd.USER_VERSION_INFO, 0, remote.id)
+				:write("vvq",
+					self.vcore,
+					self.vdata,
+					null_parser)
+				:transmit(remote)
+		end,
+		[xcmd.SERVER_SESSION_CLOSE] = function (self, remote, request)
+			return self:master_session_action("close", remote, request)
+		end,
+		[xcmd.SERVER_GET_TOP_USERS] = function (self, remote, request)
+			remote.log("debug", "get top users")
+			local count = request.count
+			local ids = {}
+			local accounts = {}
+			for id, account in register:pairs() do
+				if not account.banned then
+					ids[account] = id
+					table.insert(accounts, account)
+				end
+			end
+			table.sort(accounts, function (a, b)
+				a = a.score * 10000 + a.games_win
+				b = b.score * 10000 + b.games_win
+				return a > b
+			end)
+			local mark = 1
+			if self.vdata >= 0x00010306 then
+				mark = 2
+			end
+			local response = xpackage(xcmd.USER_GET_TOP_USERS, remote.id, remote.id)
+			for _, account in ipairs(accounts) do
+				if count == 0 then
+					break
+				end
+				count = count - 1
+				response
+					:write_byte(mark)
+					:write_object(account, "ss444t",
+						"nickname",
+						"country",
+						"score",
+						"games_played",
+						"games_win",
+						"last_game")
+				if mark >= 2 then
+					response
+						:write_dword(ids[account])
+				end
+			end
+			return response
+				:write_byte(0)
+				:transmit(remote)
+		end,
+		[xcmd.SERVER_UPDATE_INFO] = function (self, remote, request)
+			remote.log("info", "updating client info")
+			local password_changed = (remote.password ~= request.password)
+			if password_changed and managed_accounts() then
+				-- the game sends its stored password with every profile update; keep ours
+				remote.log("info", "password change from the game refused, accounts are managed")
+				password_changed = false
+				if xconfig.accounts.message then
+					xpackage(xcmd.USER_MESSAGE, 0, 0)
+						:write("s", xconfig.accounts.message)
+						:transmit(remote)
+				end
+			else
+				remote.password = request.password
+			end
+			remote.nickname = request.nickname
+			remote.country = request.country
+			remote.info = request.info
+			register:update(remote)
+			xmatchlog.account(remote, remote.id, "update", password_changed)
+			local response = xpackage(xcmd.USER_UPDATE_INFO, remote.id, 0)
+				:write_object(remote, "sss1",
+					"nickname",
+					"country",
+					"info",
+					"states")
+			if self.vdata >= 0x00020100 then
+				response
+					:write_object(remote, "444td",
+						"score",
+						"games_played",
+						"games_win",
+						"last_game",
+						"pingtime")
+			end
+			return response
+				:broadcast(remote)
+		end,
+		[xcmd.SERVER_SESSION_KICK] = function (self, remote, request)
+			return self:master_session_action("kick", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_CLSCORE] = function (self, remote, request)
+			return self:master_session_action("clscore", remote, request)
+		end,
+		[xcmd.SERVER_SESSION_PARSER] = function (self, remote, request)
+			if request.parser_id == xconst.parser.LAN_ROOM_SERVER_DATASYNC then
+				self:master_session_action("datasync", remote, request)
+			end
+			return xpackage(xcmd.USER_SESSION_PARSER, request.id_from, request.id_to)
+				:write_object(request, "4p",
+					"parser_id",
+					"parser")
+				:write_dword(0)
+				:session_dispatch(remote)
+		end,
+		[xcmd.SERVER_GET_SESSIONS] = function (self, remote, request)
+			local response = xpackage(xcmd.USER_GET_SESSIONS, remote.id, remote.id)
+			self:get_server_sessions(response)
+			return response
+				:transmit(remote)
+		end,
+		-- clients report their ping regularly; keep it instead of logging it as unknown
+		[xcmd.PING] = function (self, remote, request)
+			remote.pingtime = request.pingtime or remote.pingtime
+		end,
+		[xcmd.SERVER_PING_LOCK] = function (self, remote, request)
+		end,
+		[xcmd.SERVER_PING_UNLOCK] = function (self, remote, request)
+		end,
+		[xcmd.SERVER_CHECKSUM] = function (self, remote, request)
+		end,
+		[xcmd.LAN_PARSER] = function (self, remote, request)
+			if request.parser_id == xconst.parser.LAN_GAME_SESSION_RESULTS
+			or request.parser_id == xconst.parser.LAN_GAME_SURRENDER_CONFIRM then
+				if remote.session then
+					remote.session.has_result = true -- no !remake after a result
+					xmatchlog.result(remote.session, remote, request)
+				end
+				return self:master_session_action("results", remote, request)
+			end
+		end,
+	}
+	local function version_str(...)
+		local count = select("#", ...)
+		return xpack()
+			:write(("v"):rep(count), ...)
+			:reader()
+			:read(("s"):rep(count))
+	end
+	servers = {}
+	local function get_server(vcore, vdata)
+		local tag = ("%s/%s"):format(version_str(vcore, vdata))
+		local server = servers[tag]
+		if not server then
+			log("debug", "creating new server: %s", tag)
+			server = server_core(vcore, vdata)
+			servers[tag] = server
+		end
+		return server
+	end
+	local auth_core = xclass
+	{
+		__parent = custom_core,
+		connected = function (self, remote)
+			self.clients[remote] = true
+			return custom_core.connected(self, remote)
+		end,
+		disconnected = function (self, remote)
+			self.clients[remote] = nil
+			return custom_core.disconnected(self, remote)
+		end,
+		try_user_auth = function (self, remote, request)
+			-- 3 Incorrect Internet game key
+			-- 4 (core) Your version is outdated. Do you want to update it automatically?
+			-- 5 (data) Your version of the game is outdated. Please close the program to permit the automatic
+			--   update service of your distribution platform to bring the game up to date.
+			if not xkeys(request.cdkey, request.email) then
+				remote.log("info", "invalid cd key")
+				return 3
+			end
+			if request.code == xcmd.SERVER_REGISTER then
+				-- 1 This e-mail is already in use
+				-- 6 Incorrect registration data
+				if managed_accounts() then
+					remote.log("info", "registration from the game refused, accounts are managed: %s", request.email)
+					return 6
+				end
+				if not register:new(remote, request) then
+					remote.log("error", "email is already in use: %s", request.email)
+					return 1
+				end
+			else
+				-- 1 Invalid password
+				-- 2 This account is blocked
+				if not register:get(remote, request.email) then
+					remote.log("error", "email is not registered: %s", request.email)
+					return 1
+				elseif remote.banned then
+					remote.log("info", "account is banned: %s", request.email)
+					return 2
+				elseif remote.password ~= request.password then
+					remote.log("info", "incorrect password for: %s", request.email)
+					return 1
+				else
+					for _, server in pairs(servers) do
+						if server.clients[remote.id] then
+							remote.log("info", "already logged in: %s", request.email)
+							return 2
+						end
+					end
+				end
+			end
+			return 0
+		end,
+		user_auth = function (self, remote, request)
+			local response_code = (request.code == xcmd.SERVER_REGISTER) and xcmd.USER_REGISTER or xcmd.USER_AUTHENTICATE
+			remote.log("debug", "auth: email=%s, vcore=%s, vdata=%s", request.email, version_str(request.vcore, request.vdata))
+			local error_code = self:try_user_auth(remote, request)
+			local response = xpackage(response_code, remote.id or 0, remote.id or 0)
+				:write_byte(error_code)
+			if error_code ~= 0 then
+				return response
+					:transmit(remote)
+			end
+			xmatchlog.account(remote, remote.id,
+				(request.code == xcmd.SERVER_REGISTER) and "register" or "login")
+			self:disconnected(remote)
+			self = get_server(request.vcore, request.vdata)
+			self:connected(remote)
+			response
+				:write_object(remote, "ss444ts",
+					"nickname",
+					"country",
+					"score",
+					"games_played",
+					"games_win",
+					"last_game",
+					"info")
+			self:get_server_clients(response)
+			self:get_server_sessions(response)
+			response
+				:transmit(remote)
+			response = xpackage(xcmd.USER_CONNECTED, remote.id, 0)
+				:write_object(remote, "sss1",
+					"nickname",
+					"country",
+					"info",
+					"states")
+			if self.vdata >= 0x00020100 then
+				response
+					:write_object(remote, "444td",
+						"score",
+						"games_played",
+						"games_win",
+						"last_game",
+						"pingtime")
+			end
+			response
+				:broadcast(remote)
+			local message =
+			{
+				"%color(00DD00)%",
+				xversion.sich,
+				" powered by ",
+				xversion.lua,
+				"%color(default)%"
+			}
+			xpackage(xcmd.USER_MESSAGE, 0, 0)
+				:write("s", table.concat(message))
+				:transmit(remote)
+			return remote.log("info", "logged in")
+		end,
+		[xcmd.SERVER_REGISTER] = function (self, remote, request)
+			return self:user_auth(remote, request)
+		end,
+		[xcmd.SERVER_AUTHENTICATE] = function (self, remote, request)
+			return self:user_auth(remote, request)
+		end,
+		[xcmd.SERVER_USER_EXIST] = function (self, remote, request)
+			return xpackage(xcmd.USER_USER_EXIST, 0, 0)
+				:write("sb",
+					request.email,
+					register:exist(request.email))
+				:transmit(remote)
+		end,
+		[xcmd.SERVER_FORGOT_PSW] = function (self, remote, request)
+			local id, account = register:find(request.email)
+			if not id then
+				return
+			end
+			-- never the password itself: logs are read by more people than the account store
+			return remote.log("info", "user #%d asked for a password reminder", id)
+		end,
+	}
+	auth_server = auth_core()
+	xserver = function (socket)
+		local remote = xclient(socket)
+		remote.log("info", "connected")
+		auth_server:connected(remote)
+		local server_process =
+		{
+			[xcmd.LAN_PARSER] = true,
+		}
+		-- QLadder mod statistics (mod/PROTOCOL.md): recorded, never relayed to the players
+		local QLADDER_STATS = 7700
+		local function is_mod_report(packet)
+			if packet.code ~= xcmd.LAN_PARSER then
+				return false
+			end
+			local b = packet:get_buffer()
+			if #b < 4 then
+				return false
+			end
+			local b1, b2, b3, b4 = b:byte(1, 4)
+			return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216 == QLADDER_STATS
+		end
+		while true do
+			local packet = xpacket:receive(socket)
+			if not packet then
+				break
+			end
+			local code = packet.code
+			local session = remote.session
+			xrecord.packet(session, packet)
+			if code == xcmd.LAN_RECORD and session and remote.id == session.master_id then
+				xcommands.host_record(session, packet:get_buffer())
+			end
+			if 0x0190 <= code and code <= 0x01F4 then
+				packet:dump_head(remote.log)
+				remote.server:process(remote, packet)
+			elseif session and is_mod_report(packet) then
+				remote.log("debug", "qladder mod report, %d bytes", #packet:get_buffer())
+			elseif session then
+				if server_process[code] then
+					remote.server:process(remote, packet)
+				end
+				local buffer = packet:get()
+				local id_to = packet.id_to
+				if id_to ~= 0 then
+					local client = session.clients[id_to]
+					if client then
+						client.socket:send(buffer)
+					end
+				else
+					for _, client in pairs(session.clients) do
+						if client ~= remote then
+							client.socket:send(buffer)
+						end
+					end
+				end
+			end
+		end
+		remote.server:disconnected(remote)
+		remote.log("info", "disconnected")
+		socket:close()
+	end
+end
+
+-- // xadmin // --
+do
+	local log = xlog("xadmin")
+	local function find_user(user)
+		local user_id = tonumber(user)
+		for id, account in register:pairs() do
+			if id == user_id
+			or account.email == user
+			or account.nickname == user
+			then
+				return id, account
+			end
+		end
+		return nil, nil
+	end
+	local function find_client(id)
+		for _, server in pairs(servers) do
+			if server.clients[id] then
+				return server.clients[id]
+			end
+		end
+		return nil
+	end
+	local function find_online(user)
+		local id, account = find_user(user)
+		if not id then
+			return nil, ("user not found: %s"):format(user)
+		end
+		local client = find_client(id)
+		if not client then
+			return nil, ("client is offline: #%d %s"):format(id, account.nickname)
+		end
+		return client
+	end
+	xadmin = xclass
+	{
+		commands = {},
+		command = function (class, name, args, description, argc, handler)
+			local command =
+			{
+				name = name,
+				args = args,
+				description = description,
+				argc = argc,
+				handler = handler,
+			}
+			class.commands[name] = command
+			table.insert(class.commands, command)
+		end,
+		__create = function (self, socket)
+			self.socket = socket
+			self.host, self.port = socket:getpeername()
+			self:log("info", "connected")
+			self:table_begin()
+			self:table_row(("%s powered by %s"):format(xversion.sich, xversion.lua))
+			self:table_end()
+			self:start()
+			socket:close()
+			self:log("info", "disconnected")
+			return self
+		end,
+		log = function (self, level, fmt, ...)
+			log(level, "[%s:%s] " .. fmt, self.host, self.port, ...)
+		end,
+		start = function (self)
+			while true do
+				self.socket:send("> ")
+				local line = {}
+				while true do
+					local char = self.socket:receive(1)
+					if not char then
+						return
+					end
+					local byte = char:byte()
+					if byte == 8 or byte == 127 then
+						line[#line] = nil
+					elseif byte == 13 then
+						line = table.concat(line)
+						break
+					elseif 32 <= byte and byte < 127 then
+						line[#line + 1] = char
+					end
+				end
+				if #line > 0 then
+					self:log("debug", 'exec: "%s"', line)
+					local words = {}
+					for word in line:gmatch("[%S]+") do
+						table.insert(words, word)
+					end
+					if words[1] then
+						self:process(table.remove(words, 1), words)
+					end
+				end
+			end
+		end,
+		process = function (self, cmd, argv)
+			if #cmd < 3 then
+				return self:writeln("type at least 3 first letters of the command")
+			end
+			local selected = nil
+			local pattern = "^" .. cmd:gsub("%W", "%%%1")
+			for _, command in ipairs(self.commands) do
+				if command.name:match(pattern) then
+					if selected == nil then
+						selected = command
+					elseif selected == false then
+						self:writeln("? %s", command.name)
+					else
+						self:writeln("? %s", selected.name)
+						self:writeln("? %s", command.name)
+						selected = false
+					end
+				end
+			end
+			if selected == nil then
+				return self:writeln("unknown command")
+			end
+			if selected == false then
+				return self:writeln("ambiguous command")
+			end
+			if #argv < selected.argc then
+				return self:writeln("command requires at least %d argument%s", selected.argc, selected.argc > 1 and "s" or "")
+			end
+			return selected.handler(self, unpack(argv))
+		end,
+		writeln = function (self, fmt, ...)
+			return self.socket:send((fmt .. "\r\n"):format(...))
+		end,
+		table_begin = function (self, ...)
+			self.table_head = {}
+			self.table_cols = {}
+			self.table_rows = {}
+			for i, head in ipairs {...} do
+				self.table_head[i] = head
+				self.table_cols[i] = #head
+			end
+		end,
+		table_row = function (self, ...)
+			local row = {}
+			for i, cell in ipairs {...} do
+				cell = tostring(cell)
+				row[i] = cell
+				if (not self.table_cols[i]) or (self.table_cols[i] < #cell) then
+					self.table_cols[i] = #cell
+				end
+			end
+			return table.insert(self.table_rows, row)
+		end,
+		table_end = function (self)
+			local row_strips = {}
+			local row_format = {}
+			for _, col in ipairs(self.table_cols) do
+				table.insert(row_strips, ("-"):rep(col))
+				table.insert(row_format, "%-" .. col .. "s")
+			end
+			row_strips = "+-" .. table.concat(row_strips, "-+-") .. "-+\r\n"
+			row_format = "| " .. table.concat(row_format, " | ") .. " |\r\n"
+			local buffer = {}
+			table.insert(buffer, row_strips)
+			if #self.table_head > 0 then
+				table.insert(buffer, row_format:format(unpack(self.table_head)))
+				table.insert(buffer, row_strips)
+			end
+			for _, row in ipairs(self.table_rows) do
+				table.insert(buffer, row_format:format(unpack(row)))
+			end
+			table.insert(buffer, row_strips)
+			self.table_head = nil
+			self.table_cols = nil
+			self.table_rows = nil
+			return self.socket:send(table.concat(buffer))
+		end,
+	}
+	xadmin:command("info", "", "server info", 0, function (self)
+		self:table_begin()
+		local count = 0
+		for _ in register:pairs() do
+			count = count + 1
+		end
+		self:table_row("registered users", count)
+		count = 0
+		for tag, server in pairs(servers) do
+			local clients_count = server:get_clients_count()
+			self:table_row(tag, clients_count)
+			count = count + clients_count
+		end
+		self:table_row("online users", count)
+		self:table_row("running threads", xsocket.thread_count)
+		return self:table_end()
+	end)
+	xadmin:command("users", "", "list online users", 0, function (self)
+		self:table_begin("vcore/vdata", "id", "nickname", "session", "state")
+		for client in pairs(auth_server.clients) do
+			self:table_row("", "", client.host .. ":" .. client.port, "", "auth")
+		end
+		for tag, server in pairs(servers) do
+			for _, client in pairs(server.clients) do
+				local state = "online"
+				for _, state_name in ipairs {"played", "master", "session"} do
+					if client:get_state(state_name) then
+						state = state_name
+						break
+					end
+				end
+				local session_name = client.session and client.session.real_name or ""
+				self:table_row(tag, client.id, client.nickname, session_name, state)
+			end
+		end
+		return self:table_end()
+	end)
+	xadmin:command("sessions", "", "list sessions", 0, function (self)
+		self:table_begin("vcore/vdata", "master id", "name", "password", "state", "users")
+		for tag, server in pairs(servers) do
+			for master_id, session in pairs(server.sessions) do
+				local state = ""
+				if session.locked then
+					state = "locked"
+				elseif session.closed then
+					state = "closed"
+				end
+				local master = session.clients[master_id]
+				self:table_row(tag, master_id, session.real_name, session.real_pass, state, master and master.nickname or "[master is out]")
+				for client_id, client in pairs(session.clients) do
+					if client_id ~= master_id then
+						self:table_row("", "", "", "", "", client.nickname)
+					end
+				end
+			end
+		end
+		return self:table_end()
+	end)
+	xadmin:command("register", "[user]", "list registered users", 0, function (self, user)
+		self:table_begin("id", "nickname", "email", "password", "games_played", "games_win", "score", "last_game", "banned")
+		local function show(id, account)
+			return self:table_row(id, account.nickname, account.email, account.password, account.games_played,
+				account.games_win, account.score, os.date("%Y.%m.%d %H:%M:%S", account.last_game), tostring(account.banned))
+		end
+		local id, account = find_user(user)
+		if id then
+			show(id, account)
+		elseif user then
+			--
+		else
+			for id, account in register:pairs() do
+				show(id, account)
+			end
+		end
+		return self:table_end()
+	end)
+	xadmin:command("update", "<user> <key> <value>", "update register", 3, function (self, user, key, ...)
+		local id, account = find_user(user)
+		if not id then
+			return self:writeln("user not found")
+		end
+		if account[key] == nil then
+			return self:writeln("key not exist")
+		end
+		local value = table.concat({...}, " ")
+		local tp = type(account[key])
+		if tp == "boolean" then
+			value = value:lower()
+			if value == "false" or value == "0" then
+				value = false
+			elseif value == "true" or value == "1" then
+				value = true
+			else
+				return self:writeln("not a boolean value")
+			end
+		elseif tp == "number" then
+			value = tonumber(value)
+			if not value then
+				return self:writeln("not a numeric value")
+			end
+		end
+		local client = find_client(id)
+		if client then
+			client[key] = value
+			register:update(client)
+		else
+			account[key] = value
+			register:save()
+		end
+	end)
+	xadmin:command("kick", "<user>", "disconnect online user", 1, function (self, user)
+		local client, msg = find_online(user)
+		if not client then
+			return self:writeln(msg)
+		end
+		client.socket:close()
+		return self:writeln("kicked: #%d %s", client.id, client.nickname)
+	end)
+	xadmin:command("ban", "<user>", "disable user account", 1, function (self, user)
+		local id, account = find_user(user)
+		if not (id and register:ban(id, true)) then
+			return self:writeln("unknown user: %s", user)
+		end
+		return self:writeln("account is banned: #%d %s", id, account.nickname)
+	end)
+	xadmin:command("unban", "<user>", "enable user account", 1, function (self, user)
+		local id, account = find_user(user)
+		if not (id and register:ban(id, false)) then
+			return self:writeln("unknown user: %s", user)
+		end
+		return self:writeln("account is unbanned: #%d %s", id, account.nickname)
+	end)
+	xadmin:command("message", "<user> <text>", "send message", 2, function (self, user, ...)
+		local client, msg = find_online(user)
+		if not client then
+			return self:writeln(msg)
+		end
+		local text = table.concat({...}, " ")
+		if not client.session then
+			xpackage(xcmd.USER_MESSAGE, 0, client.id)
+				:write("s", text)
+				:dispatch(client)
+		elseif not client.session.locked then
+			xpackage(xcmd.USER_SESSION_MSG, 0, client.id)
+				:write("s", text)
+				:session_dispatch(client)
+		else
+			xpackage(xcmd.USER_SESSION_MSG, 0, client.id)
+				:write("s", "0|en\7" .. text)
+				:session_dispatch(client)
+		end
+	end)
+	xadmin:command("traceback", "", "show traceback for sockets", 0, function (self, user)
+		local sock_clients = {}
+		for _, server in pairs(servers) do
+			for _, client in pairs(server.clients) do
+				sock_clients[client.socket.sock] = client
+			end
+		end
+		local sets =
+		{
+			{"sendt", xsocket.sendt},
+			{"recvt", xsocket.recvt},
+			{"slept", xsocket.slept},
+		}
+		self:table_begin("client", "set", "socket", "local addr", "remote addr", "traceback")
+		for _, pair in ipairs(sets) do
+			local set_name, set = unpack(pair)
+			for _, sock in ipairs(set) do
+				local client_nickname = ""
+				if sock_clients[sock] then
+					client_nickname = sock_clients[sock].nickname
+				end
+				local sock_str = tostring(sock):match("^[^:]+")
+				local local_addr = ""
+				local ok, ip, port = pcall(sock.getsockname, sock)
+				if ok and ip then
+					local_addr = ("%s:%s"):format(ip, port)
+				end
+				local remote_addr = ""
+				local ok, ip, port = pcall(sock.getpeername, sock)
+				if ok and ip then
+					remote_addr = ("%s:%s"):format(ip, port)
+				end
+				for thread_index, thread in ipairs(set[sock].threads) do
+					local first_line = (thread_index == 1)
+					local traceback = debug.traceback(thread, tostring(thread), 1)
+					for line in traceback:gmatch("[^\n]+") do
+						if line:match("^\t") then
+							line = "  " .. line:match("^%s*(.-)%s*$")
+						end
+						if first_line then
+							first_line = false
+							self:table_row(client_nickname, set_name, sock_str, local_addr, remote_addr, line)
+						else
+							self:table_row("", "", "", "", "", line)
+						end
+					end
+				end
+			end
+		end
+		return self:table_end()
+	end)
+	xadmin:command("stop", "", "stop server", 0, function (self)
+		return os.exit()
+	end)
+	xadmin:command("help", "", "print available commands", 0, function (self, cmd)
+		self:table_begin()
+		local pattern = cmd and ("^" .. cmd:gsub("%W", "%%%1"))
+		for _, command in ipairs(self.commands) do
+			if not pattern or command.name:match(pattern) then
+				self:table_row(command.name .. " " .. command.args, command.description)
+			end
+		end
+		return self:table_end()
+	end)
+	xadmin:command("exit", "", "close this console", 0, function (self)
+		return self.socket:close()
+	end)
+	if not xconfig.admin then
+		log("info", "disabled")
+	else
+		local host, port = assert(xconfig.admin.host, "no admin.host"), assert(xconfig.admin.port, "no admin.port")
+		local server_socket = assert(xsocket.tcp())
+		assert(server_socket:bind(host, port))
+		assert(server_socket:listen(32))
+		log("info", "listening at %s", tostring(server_socket))
+		xsocket.spawn(
+			function ()
+				while true do
+					xsocket.spawn(xadmin, assert(server_socket:accept()))
+				end
+			end)
+	end
+end
+
+-- // xapi // --
+do
+	-- QLadder: local machine API for the web app.
+	-- One request per connection, one line: TOKEN \t OP \t ARG... \n
+	-- Reply: "ok \t ..." or "err \t code".
+	--   create EMAIL NICKNAME PASSWORD STEAM_ACCOUNT_ID -> ok ID
+	--   passwd ID PASSWORD                             -> ok
+	--   pause MASTER_ID [FROM_ID]                      -> ok
+	--     toggles the pause of a running match: the room's host gets the record a
+	--     player's game sends when its pause key is pressed (a GUI record, ReadPause).
+	--     The host takes it only from a player of its room (a real match, 2026-09-26:
+	--     from id 0 it was ignored). FROM_ID defaults to a player other than the host.
+	local log = xlog("xapi")
+	local MAX_LINE = 1024
+	-- 00 04: a record of the GUI machine (menu.aix); section 66 = ReadPause; its Boolean; 01 end.
+	-- The host toggles its pause whatever the Boolean says, and tells everyone.
+	local PAUSE_RECORD = "\0\4\66\0\0\1"
+	local function find_session(master_id)
+		for _, server in pairs(servers or {}) do
+			if server.sessions[master_id] then
+				return server.sessions[master_id]
+			end
+		end
+		return nil
+	end
+	local function valid_nickname(nick)
+		return #nick >= 4 and #nick <= 16 and not nick:find("[^%w%(%)%+%-_%.%[%]]")
+	end
+	local function valid_email(email)
+		return #email <= 64 and email:match("^[%w%._%+%-]+@[%w%.%-]+%.%a+$") ~= nil
+	end
+	local function valid_password(password)
+		return #password >= 8 and #password <= 32 and not password:find("[^%w]")
+	end
+	local function nickname_taken(nick)
+		nick = nick:lower()
+		for _, account in register:pairs() do
+			if (account.nickname or ""):lower() == nick then
+				return true
+			end
+		end
+		return false
+	end
+	local function online_client(id)
+		for _, server in pairs(servers or {}) do
+			if server.clients[id] then
+				return server.clients[id]
+			end
+		end
+		return nil
+	end
+	local ops =
+	{
+		create = function (email, nick, password, steam)
+			if not (email and nick and password and steam) then
+				return "err\targs"
+			end
+			email = email:lower()
+			if not valid_email(email) then
+				return "err\temail_invalid"
+			elseif not valid_nickname(nick) then
+				return "err\tnickname_invalid"
+			elseif not valid_password(password) then
+				return "err\tpassword_invalid"
+			elseif not tonumber(steam) then
+				return "err\tsteam_invalid"
+			elseif register:exist(email) then
+				return "err\temail_taken"
+			elseif nickname_taken(nick) then
+				return "err\tnickname_taken"
+			end
+			local client = {}
+			register:new(client, {
+				email = email,
+				password = password,
+				cdkey = "",
+				nickname = nick,
+				country = "",
+				info = ("sic|%d|src|web|"):format(tonumber(steam)),
+			})
+			log("info", "registered from web: #%d %s", client.id, nick)
+			xmatchlog.account(client, client.id, "register")
+			return "ok\t" .. client.id
+		end,
+		passwd = function (id, password)
+			id = tonumber(id)
+			local account = id and register[id]
+			if not account then
+				return "err\tnot_found"
+			elseif not (password and valid_password(password)) then
+				return "err\tpassword_invalid"
+			end
+			account.password = password
+			-- an online client would write its old password back on the next profile update
+			local client = online_client(id)
+			if client then
+				client.password = password
+			end
+			register:save()
+			log("info", "password changed from web: #%d %s", id, account.nickname or "")
+			return "ok"
+		end,
+		pause = function (master_id, from_id)
+			local session = find_session(tonumber(master_id) or -1)
+			local host = session and session.clients[session.master_id]
+			if not host then
+				return "err\tnot_found"
+			elseif not session.locked then
+				return "err\tnot_started"
+			end
+			local from = tonumber(from_id)
+			if not from then
+				for id in pairs(session.clients) do
+					if id ~= session.master_id then
+						from = id
+						break
+					end
+				end
+			end
+			-- the host alone (a match against computers): untested whether it takes its own id
+			from = from or session.master_id
+			xrecord.marker(session, {ev = "server_pause", id = from})
+			local packet = xpackage(xcmd.LAN_RECORD, from, session.master_id)
+				:write_buffer(PAUSE_RECORD)
+			-- ops run under pcall, and a socket send may yield: send from a coroutine of its own
+			xsocket.spawn(function () packet:transmit(host) end)
+			log("info", "pause toggled from the api: %s", session.real_name)
+			return "ok"
+		end,
+	}
+	local function handle(socket)
+		local line = {}
+		while #line < MAX_LINE do
+			local char = socket:receive(1)
+			if not char or char == "\n" then
+				break
+			end
+			line[#line + 1] = char
+		end
+		line = table.concat(line):gsub("\r$", "")
+		local words = {}
+		for word in (line .. "\t"):gmatch("([^\t]*)\t") do
+			table.insert(words, word)
+		end
+		local token, op = table.remove(words, 1), table.remove(words, 1)
+		local reply
+		if token ~= xconfig.api.token then
+			log("warn", "bad token")
+			reply = "err\tauth"
+		elseif not ops[op or ""] then
+			reply = "err\tunknown_op"
+		else
+			local ok, result = pcall(ops[op], unpack(words))
+			if ok then
+				reply = result
+			else
+				log("error", "%s failed: %s", op, tostring(result))
+				reply = "err\tinternal"
+			end
+		end
+		socket:send(reply .. "\n")
+		socket:close()
+	end
+	if not (xconfig.api and xconfig.api.token and #xconfig.api.token >= 32) then
+		log("info", "disabled")
+	else
+		local host = xconfig.api.host or "127.0.0.1"
+		local port = assert(xconfig.api.port, "no api.port")
+		local server_socket = assert(xsocket.tcp())
+		assert(server_socket:bind(host, port))
+		assert(server_socket:listen(32))
+		log("info", "listening at %s", tostring(server_socket))
+		xsocket.spawn(
+			function ()
+				while true do
+					xsocket.spawn(handle, assert(server_socket:accept()))
+				end
+			end)
+	end
+end
+
+-- // xautopause // --
+do
+	-- The automatic pause: a player whose game stops taking the match (a network
+	-- that stalls, a game that freezes) gets the match paused until they are back.
+	--
+	-- The host streams the match to every player all the time (several packets a
+	-- second), so a player's system acknowledges data all the time too. When a
+	-- player has data waiting for an acknowledgement and none has come for
+	-- `stall` seconds, the player is stalled: the server asks the host for a pause
+	-- as that player (the host takes a pause record only from a player of its
+	-- room), and tells the room. When the acknowledgements flow again for
+	-- `resume` seconds, or after `max` seconds, it asks for the match to go on.
+	-- The pause is a toggle and players press it too: the server follows the
+	-- host's state (xcommands.host_record) and leaves a pause the players ended.
+	--
+	-- config.store:
+	--   autopause = {
+	--     stall = 4,        -- seconds without an acknowledgement
+	--     resume = 2,       -- seconds a player must be back
+	--     max = 120,        -- the longest automatic pause
+	--     per_player = 3,   -- automatic pauses a player may get in a match
+	--   },
+	--
+	-- The acknowledgements come from the system: `ss -tin` (iproute2) for the
+	-- lobby port, once a second while a match of two players or more runs.
+	local log = xlog("xautopause")
+	local config = xconfig.autopause
+	local STALL = config and config.stall or 4
+	local RESUME = config and config.resume or 2
+	local MAX = config and config.max or 120
+	local PER_PLAYER = config and config.per_player or 3
+	local PORT = xconfig.port or 31523
+	-- "1.2.3.4:5678" / "[::ffff:1.2.3.4]:5678" -> "1.2.3.4:5678"
+	local function address(text)
+		local host, port = text:match("^%[(.*)%]:(%d+)$")
+		if not host then
+			host, port = text:match("^(.*):(%d+)$")
+		end
+		if not host then
+			return nil
+		end
+		return host:gsub("^::ffff:", "") .. ":" .. port
+	end
+	-- {peer address: {lastack = ms, unacked = packets}} for the lobby port's connections
+	local function tcp_state()
+		local out = {}
+		local pipe = io.popen(("ss -tinH state established '( sport = :%d )' 2>/dev/null"):format(PORT))
+		if not pipe then
+			return out
+		end
+		local peer
+		for line in pipe:lines() do
+			if line:match("^%s") then
+				if peer then
+					out[peer] = {
+						lastack = tonumber(line:match("lastack:(%d+)")),
+						unacked = tonumber(line:match("unacked:(%d+)")) or 0,
+					}
+				end
+			else
+				-- Recv-Q Send-Q Local Peer
+				local fields = {}
+				for word in line:gmatch("%S+") do
+					table.insert(fields, word)
+				end
+				peer = fields[4] and address(fields[4])
+			end
+		end
+		pipe:close()
+		return out
+	end
+	local function peer_of(client)
+		return client.host and client.port and (client.host .. ":" .. client.port)
+	end
+	local function players(session)
+		local n = 0
+		for _, client in pairs(session.clients) do
+			if client.cid ~= xconst.spectator_countryid then
+				n = n + 1
+			end
+		end
+		return n
+	end
+	-- started matches with two players or more (the only ones a server pause can reach), and any
+	-- with an automatic pause on (the stalled player may have left since)
+	local function matches()
+		local out = {}
+		for _, server in pairs(servers or {}) do
+			for _, session in pairs(server.sessions) do
+				if session.locked and not session.closed and (players(session) >= 2 or session.autopause) then
+					table.insert(out, session)
+				end
+			end
+		end
+		return out
+	end
+	-- a stall: data waits for an acknowledgement, and none came for `stall` seconds (lastack is
+	-- missing on a connection that has never been acknowledged)
+	local function stalled(state)
+		return state ~= nil and state.unacked > 0 and (state.lastack or math.huge) >= STALL * 1000
+	end
+	local function flowing(state)
+		return state ~= nil and (state.unacked == 0 or (state.lastack or math.huge) < 1000)
+	end
+	local function start(session, client, now)
+		session.autopauses = session.autopauses or {}
+		session.autopauses[client.id] = (session.autopauses[client.id] or 0) + 1
+		client.stall_seen = true -- one pause for one stall
+		local nick = client.nickname or "?"
+		if not xcommands.send_pause(session, true, client.id) then
+			return
+		end
+		session.autopause = {id = client.id, nick = nick, since = now}
+		xrecord.marker(session, {ev = "autopause", id = client.id})
+		log("info", "%s stalled: pause asked in %s", nick, session.real_name or "?")
+		xcommands.say(session, "autopause", nick, MAX)
+	end
+	-- the pause ends: resume it if the host says it is on and the server may still send to it
+	local function finish(session, key, ...)
+		local ap = session.autopause
+		session.autopause = nil
+		local resumed, was_paused = true, session.paused
+		if session.paused then
+			local client = session.clients[ap.id]
+			local from = client and client.id or xcommands.record_sender(session, session.clients[session.master_id] or {})
+			resumed = xcommands.send_pause(session, false, from)
+		end
+		xrecord.marker(session, {ev = "autoresume", id = ap.id, why = key})
+		log("info", "%s: %s in %s (the host's pause %s, resume %s)", ap.nick, key, session.real_name or "?",
+			was_paused and "on" or "off", was_paused and (resumed and "asked" or "cannot be asked") or "not needed")
+		if key == "autogone" and not resumed then
+			key = "autogone_key" -- the host is alone now: only its pause key resumes
+		end
+		xcommands.say(session, key, ...)
+	end
+	local check_session
+	local function check(session, tcp, now)
+		-- one check of a room at a time: a check that sends may wait on a socket past the next tick
+		if session.autopause_busy and now - session.autopause_busy < 10 then
+			return
+		end
+		session.autopause_busy = now
+		check_session(session, tcp, now)
+		session.autopause_busy = nil
+	end
+	check_session = function (session, tcp, now)
+		local ap = session.autopause
+		if ap then
+			local client = session.clients[ap.id]
+			if not client then
+				return finish(session, "autogone", ap.nick)
+			end
+			if session.paused then
+				ap.confirmed = true
+			elseif ap.confirmed then
+				session.autopause = nil -- the players resumed it themselves: leave it
+				return
+			end
+			if flowing(tcp[peer_of(client)]) then
+				ap.back = ap.back or now
+			else
+				ap.back = nil
+			end
+			if ap.back and now - ap.back >= RESUME then
+				return finish(session, "autoresume", ap.nick)
+			elseif now - ap.since >= MAX then
+				return finish(session, "autotimeout", ap.nick, MAX)
+			end
+			return
+		end
+		for id, client in pairs(session.clients) do
+			if id ~= session.master_id and client.cid ~= xconst.spectator_countryid then
+				local state = tcp[peer_of(client)]
+				if not stalled(state) then
+					client.stall_seen = nil
+				elseif not client.stall_seen and not session.paused
+					and ((session.autopauses or {})[id] or 0) < PER_PLAYER then
+					return start(session, client, now)
+				end
+			end
+		end
+	end
+	xautopause =
+	{
+		enabled = (config ~= nil),
+		-- for tests
+		address = address,
+		stalled = stalled,
+		flowing = flowing,
+	}
+	if config then
+		log("info", "on: stall %d s, resume %d s, max %d s, %d a player", STALL, RESUME, MAX, PER_PLAYER)
+		xsocket.spawn(
+			function ()
+				while true do
+					xsocket.sleep(1.0)
+					local sessions = matches()
+					if #sessions > 0 then
+						local ok, tcp = pcall(tcp_state)
+						if ok then
+							local now = xsocket.gettime()
+							for _, session in ipairs(sessions) do
+								-- a thread each: a check sends (sending yields), and an error stays in it
+								xsocket.spawn(check, session, tcp, now)
+							end
+						else
+							log("error", "ss: %s", tostring(tcp))
+						end
+					end
+				end
+			end)
+	else
+		log("info", "disabled")
+	end
+end
+
+-- // xecho // --
+do
+	local log = xlog("xecho")
+	if xconfig.echo == false then
+		log("info", "disabled") 
+	else
+		local host = "*"
+		local port = 31523
+		local title = nil
+		if type(xconfig.echo) == "table" then
+			host = xconfig.echo.host or host
+			port = xconfig.echo.port or port
+			title = xconfig.echo.title
+		end
+		local echo_socket = assert(xsocket.udp())
+		assert(echo_socket:setsockname(host or "*", port or 31523))
+		log("info", "listening at %s", tostring(echo_socket))
+		xsocket.spawn(function ()
+			while true do
+				local msg, ip, port = echo_socket:receivefrom()
+				if not msg then
+					return log("warn", "closed")
+				end
+				log("debug", "got %q from %s:%s", msg, ip, port)
+				echo_socket:sendto(title or xversion.sich, ip, port)
+			end
+		end)
+	end
+end
+
+-- // sich // --
+do
+	local log = xlog("sich")
+	local host = xconfig.host or "*"
+	local port = xconfig.port or 31523
+	local server_socket = assert(xsocket.tcp())
+	assert(server_socket:bind(host, port))
+	assert(server_socket:listen(32))
+	log("info", "listening at %s", tostring(server_socket))
+	-- QLadder: a game that goes away without closing its connection (a crash, a lost network)
+	-- stayed in the lobby and its room for hours. TCP keepalive finds it: after 60 s without
+	-- traffic the system probes the peer every 15 s and drops the connection after 4 unanswered
+	-- probes, about 2 minutes. The probes are TCP's own: a live game answers without knowing.
+	local KEEPALIVE = {idle = 60, interval = 15, count = 4}
+	local function keepalive(client)
+		pcall(function ()
+			client:setoption("keepalive", true)
+			client:setoption("tcp-keepidle", KEEPALIVE.idle)
+			client:setoption("tcp-keepintvl", KEEPALIVE.interval)
+			client:setoption("tcp-keepcnt", KEEPALIVE.count)
+		end)
+		return client
+	end
+	xsocket.spawn(
+		function ()
+			while true do
+				xsocket.spawn(xserver, keepalive(assert(server_socket:accept())))
+			end
+		end)
+	xsocket.loop()
+end
+
